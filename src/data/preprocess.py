@@ -60,9 +60,10 @@ def align_and_embed(app, img_bgr: np.ndarray, output_size: int = 128):
 
     embedding = face.normed_embedding.astype(np.float32)  # (512,) L2-normalized
 
-    # insightface 112×112 kırpılmış yüz döndürür
-    # norm_crop → aligned BGR 112×112
-    aligned_bgr = face.get_aligned_face() if hasattr(face, "get_aligned_face") else _manual_align(app, img_bgr, face)
+    # insightface'in Face nesnesi dict-tabanlı (attribute yoksa None döner,
+    # AttributeError fırlatmaz) — hasattr() burada güvenilmez, bu yüzden
+    # doğrudan norm_crop tabanlı manuel hizalamayı kullanıyoruz.
+    aligned_bgr = _manual_align(app, img_bgr, face)
 
     if aligned_bgr is None:
         return None, None
