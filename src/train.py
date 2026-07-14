@@ -22,6 +22,7 @@ from .config import Config, DEFAULT_CONFIG
 from .data.dataset import build_dataloaders, denormalize
 from .models.decoder import FaceDecoder
 from .models.losses import ReconstructionLoss
+from .models.evaluator import IndependentEvaluator
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,30 @@ def build_scheduler(optimizer, cfg: Config):
         schedulers=[warmup, cosine],
         milestones=[cfg.train.warmup_epochs],
     )
+
+
+# ─── Transport Simulation (INT8 Roundtrip) ────────────────────────────────────
+
+def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
+    """
+    INT8 quantization-dequantization roundtrip'ini simüle eder (PDF v2.0 §6.3).
+
+    Deployment sırasında embedding QR koddan uint8 olarak gelir ve
+    float32'ye dönüştürülür. Bu dönüşüm, küçük bir quantization gürültüsü
+    ekler. Eğitimde bu gürültüyü simüle ederek domain gap'i kapatırız.
+
+    Yalnızca embedding giriş tensörüne uygulanır; decoder parametrelerine değil.
+    Gradient geçirmez (detach sonra yeniden attach → Straight-Through Estimator).
+    """
+    with torch.no_grad():
+        e_min = embeddings.min(dim=1, keepdim=True).values
+        e_max = embeddings.max(dim=1, keepdim=True).values
+        scale = (e_max - e_min).clamp(min=1e-8) / 255.0
+        quantized   = torch.round((embeddings - e_min) / scale).clamp(0, 255)
+        dequantized = quantized * scale + e_min
+
+    # Straight-Through Estimator: gradient'i orijinal tensörden geçir
+    return embeddings + (dequantized - embeddings).detach()
 
 
 # ─── Validation ───────────────────────────────────────────────────────────────
@@ -170,6 +195,15 @@ def train(
         arcface_r50_path  = cfg.loss.arcface_r50_path,
     ).to(device)
 
+    # ── Bağımsız Evaluator (PDF v2.0 §7) ───────────────────────
+    evaluator = None
+    if cfg.train.use_independent_evaluator:
+        try:
+            evaluator = IndependentEvaluator().to(device)
+            log.info("[Evaluator] FaceNet bağımsız değerlendirici yüklendi.")
+        except Exception as exc:
+            log.warning(f"[Evaluator] Yüklenemedi: {exc} — atlanıyor.")
+
     # ── Optimizer & Scheduler ──────────────────────────────────
     optimizer = AdamW(
         model.parameters(),
@@ -206,6 +240,10 @@ def train(
         for step, (embeddings, real_imgs) in enumerate(train_loader):
             embeddings = embeddings.to(device, non_blocking=True)
             real_imgs  = real_imgs.to(device, non_blocking=True)
+
+            # Transport simulation: INT8 roundtrip (PDF v2.0 §6.3)
+            if cfg.train.transport_simulate:
+                embeddings = transport_simulate(embeddings)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -249,6 +287,24 @@ def train(
             f"identity_similarity={val_id_score:.4f}  "
             f"best={best_val_score:.4f}"
         )
+
+        # ── Bağımsız Evaluator (PDF v2.0 §7) ───────────────────
+        if (evaluator is not None
+                and (epoch + 1) % cfg.train.eval_every_epochs == 0):
+            model.eval()
+            indep_scores = []
+            with torch.no_grad():
+                for emb_b, real_b in val_loader:
+                    emb_b  = emb_b.to(device)
+                    real_b = real_b.to(device)
+                    gen_b  = model(emb_b)
+                    score  = evaluator.cosine_sim(gen_b, real_b)
+                    indep_scores.append(score.item())
+            indep_mean = sum(indep_scores) / len(indep_scores)
+            log.info(f"[Bağımsız Eval] epoch={epoch+1}  FaceNet cosine_sim={indep_mean:.4f}")
+            if writer:
+                writer.add_scalar("eval/independent_cosine_sim", indep_mean, epoch)
+            model.train()
 
         # ── Checkpoint ─────────────────────────────────────────
         is_best = val_id_score > best_val_score + cfg.train.min_delta

@@ -108,6 +108,17 @@ class TrainConfig:
     # Mixed precision (Colab T4/A100 için)
     use_amp: bool = True
 
+    # Transport Simulation (PDF v2.0 §6.3)
+    # INT8 quantization-dequantization roundtrip'ini eğitim sırasında simüle eder.
+    # Deployment ile training arasındaki domain gap'i kapatır.
+    # Yalnızca embedding giriş tensörüne uygulanır, decoder parametrelerine değil.
+    transport_simulate: bool = True
+
+    # Bağımsız evaluator (PDF v2.0 §7)
+    # Her eval_every_epochs'ta FaceNet ile kimlik skoru raporlanır (loss'a girmez).
+    use_independent_evaluator: bool = True
+    eval_every_epochs: int = 5          # Her 5 epoch'ta bir bağımsız değerlendirme
+
     # Logging
     log_dir: str = "/content/drive/MyDrive/face_recon/logs"
     log_every_steps: int = 50
@@ -153,5 +164,35 @@ class Config:
             return self.loss.phase3_weights
 
 
-# Varsayılan config — notebook'ta override edilebilir
+# ── Preset Config'ler ──────────────────────────────────────────────────────────
+
+# Varsayılan (Compact) config — ~1.1M param, ~1.5MB INT8, 128×128
 DEFAULT_CONFIG = Config()
+
+# Medium config — ~3.5M param, ~3.5MB INT8, 128×128
+# PDF v2.0 §4: daha geniş kanallar, daha derin skip connection
+MEDIUM_CONFIG = Config(
+    model=ModelConfig(
+        embedding_dim=512,
+        initial_spatial=4,
+        initial_channels=256,               # 128 → 256 (2×)
+        decoder_channels=(256, 192, 128, 64, 32),  # geniş kanal sırası
+    ),
+    loss=LossConfig(
+        phase1_epochs=10,
+        phase2_epochs=60,
+        phase3_epochs=30,
+        phase2_weights={
+            "l1": 0.5, "perceptual": 1.0, "identity": 6.0, "ssim": 0.1,
+        },
+        phase3_weights={
+            "l1": 0.2, "perceptual": 1.0, "identity": 10.0, "ssim": 0.1,
+        },
+        vgg_layer="relu3_3",
+    ),
+    train=TrainConfig(
+        epochs=100,
+        batch_size=32,     # daha büyük model → batch küçülür
+        learning_rate=5e-5,
+    ),
+)
