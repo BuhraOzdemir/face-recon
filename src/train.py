@@ -165,8 +165,9 @@ def train(
 
     # ── Loss ───────────────────────────────────────────────────
     loss_fn = ReconstructionLoss(
-        vgg_layer=cfg.loss.vgg_layer,
-        facenet_input_size=cfg.loss.facenet_input_size,
+        vgg_layer         = cfg.loss.vgg_layer,
+        facenet_input_size = cfg.loss.facenet_input_size,
+        arcface_r50_path  = cfg.loss.arcface_r50_path,
     ).to(device)
 
     # ── Optimizer & Scheduler ──────────────────────────────────

@@ -23,12 +23,19 @@ log = logging.getLogger(__name__)
 
 
 def load_insightface_app(det_size=(320, 320)):
-    """insightface FaceAnalysis uygulamasını yükle."""
+    """
+    insightface FaceAnalysis uygulamasını yükle.
+
+    buffalo_s: MobileFaceNet backbone, 512-dim embedding.
+    Bu model hem eğitimde hem telefonda kullanılır → embedding uzayı tutarlı.
+    (buffalo_l ArcFace R50 ile eğitilirdi ama telefonda MobileFaceNet çalışır
+     → embedding dağılımı uyuşmazdı.)
+    """
     import insightface
     from insightface.app import FaceAnalysis
 
     app = FaceAnalysis(
-        name="buffalo_l",
+        name="buffalo_s",   # MobileFaceNet — telefon ile aynı encoder
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
     app.prepare(ctx_id=0, det_size=det_size)

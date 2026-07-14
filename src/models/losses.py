@@ -2,14 +2,15 @@
 ReconstructionLoss: Identity + Perceptual + L1 + SSIM kombinasyonu.
 
 Loss akışı (her batch için):
-    z_target (precomputed ArcFace emb) → Decoder → I_gen
-    loss_id    = 1 - cosine_sim( FaceNet(I_gen), FaceNet(I_real) )
+    z_mobile (MobileFaceNet emb) → Decoder → I_gen
+    loss_id    = 1 - cosine_sim( IResNet50(I_gen), IResNet50(I_real) )
     loss_perc  = || VGG(I_gen) - VGG(I_real) ||_2
     loss_l1    = || I_gen - I_real ||_1
     loss_ssim  = 1 - SSIM(I_gen, I_real)
 
-Not: FaceNet (facenet-pytorch) identity loss için kullanılır — diferansiyel,
-     PyTorch-native, VGGFace2 ağırlıkları. ArcFace R50 ile değiştirilebilir.
+Identity supervisor: IResNet50-ArcFace (frozen, yalnızca eğitimde).
+Gradient akışı   : IResNet50(I_gen) → I_gen → Decoder (FaceNet fallback da aynı).
+Fallback         : IResNet50 ağırlık dosyası yoksa FaceNet kullanılır.
 """
 
 import torch
@@ -90,42 +91,65 @@ class VGGPerceptualLoss(nn.Module):
 
 class IdentityLoss(nn.Module):
     """
-    FaceNet (InceptionResnetV1, VGGFace2 pretrained) ile kimlik korunumu.
+    Kimlik korunumu loss'u.
 
-    1 - cosine_similarity( FaceNet(I_gen), FaceNet(I_real) )
+    Öncelik sırası:
+      1. IResNet50-ArcFace (arcface_r50_path verilirse) — önerilir
+      2. FaceNet fallback (her zaman kullanılabilir)
 
-    Gradyan: FaceNet frozen (parametre güncellenmez),
-             ancak I_gen üzerinden decoder'a gradient akar.
+    Gradient akışı:
+      - identity_model(generated) → NO no_grad → gradient decoder'a akar  ✓
+      - identity_model(real).detach() → gerçek görüntü gradient üretmez   ✓
 
-    Alternatif: ArcFace R50 PyTorch modeli ile değiştirilebilir.
+    Args:
+        arcface_r50_path: IResNet50 backbone.pth dosya yolu.
+                          None veya dosya yoksa FaceNet kullanılır.
+        facenet_input_size: FaceNet için resize boyutu (sadece fallback).
     """
 
-    def __init__(self, input_size: int = 160):
+    def __init__(self, arcface_r50_path: str = None, facenet_input_size: int = 160):
         super().__init__()
-        from facenet_pytorch import InceptionResnetV1
+        self.input_size = 112   # IResNet50 standart girişi
 
-        self.facenet    = InceptionResnetV1(pretrained="vggface2").eval()
-        self.input_size = input_size
+        self.use_arcface = False
+        self.identity_model = None
 
-        for p in self.facenet.parameters():
-            p.requires_grad_(False)
+        # IResNet50-ArcFace dene
+        if arcface_r50_path is not None:
+            try:
+                from src.models.iresnet import iresnet50
+                self.identity_model = iresnet50(pretrained_path=arcface_r50_path)
+                self.use_arcface    = True
+                self.input_size     = 112
+                print("[IdentityLoss] IResNet50-ArcFace yüklendi.")
+            except Exception as e:
+                print(f"[IdentityLoss] IResNet50 yüklenemedi ({e}), FaceNet'e geçiliyor.")
+
+        # FaceNet fallback
+        if not self.use_arcface:
+            from facenet_pytorch import InceptionResnetV1
+            self.identity_model = InceptionResnetV1(pretrained="vggface2").eval()
+            for p in self.identity_model.parameters():
+                p.requires_grad_(False)
+            self.input_size = facenet_input_size
+            print("[IdentityLoss] FaceNet (InceptionResnetV1-VGGFace2) kullanılıyor.")
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """[-1,1] görüntüyü FaceNet embedding'ine çevir."""
+        """[-1,1] görüntüyü identity embedding'ine çevir."""
         x_resized = _to_facenet(x, size=self.input_size)
-        emb = self.facenet(x_resized)
+        emb = self.identity_model(x_resized)
         return F.normalize(emb, dim=1)
 
     def forward(self, generated: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            generated: (B, 3, H, W) [-1, 1]
-            real:      (B, 3, H, W) [-1, 1]
+            generated: (B, 3, H, W) [-1, 1]  ← gradient akar
+            real:      (B, 3, H, W) [-1, 1]  ← detach edilir
         Returns:
-            scalar loss — düşük = iyi kimlik korunumu
+            scalar loss (düşük = iyi kimlik korunumu)
         """
-        gen_emb  = self._encode(generated)
-        real_emb = self._encode(real).detach()
+        gen_emb  = self._encode(generated)           # gradient ✓
+        real_emb = self._encode(real).detach()        # no gradient ✓
         cosine   = F.cosine_similarity(gen_emb, real_emb, dim=1)
         return 1.0 - cosine.mean()
 
@@ -156,10 +180,14 @@ class ReconstructionLoss(nn.Module):
     Ağırlıklar config.py'deki aşamalı eğitim stratejisine göre dışarıdan verilir.
     """
 
-    def __init__(self, vgg_layer: str = "relu3_3", facenet_input_size: int = 160):
+    def __init__(self, vgg_layer: str = "relu3_3", facenet_input_size: int = 160,
+                 arcface_r50_path: str = None):
         super().__init__()
         self.perceptual = VGGPerceptualLoss(layer=vgg_layer)
-        self.identity   = IdentityLoss(input_size=facenet_input_size)
+        self.identity   = IdentityLoss(
+            arcface_r50_path  = arcface_r50_path,
+            facenet_input_size = facenet_input_size,
+        )
         self.ssim_loss  = SSIMLoss()
 
     def forward(

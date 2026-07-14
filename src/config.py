@@ -73,8 +73,12 @@ class LossConfig:
     # relu3_3 → iyi doku + yapı dengesi
     vgg_layer: str = "relu3_3"
 
-    # Identity loss için FaceNet input boyutu
+    # Identity loss için FaceNet input boyutu (yalnızca fallback)
     facenet_input_size: int = 160
+
+    # IResNet50-ArcFace backbone .pth yolu (None → FaceNet fallback)
+    # Kaggle: /kaggle/working/arcface_r50.pth
+    arcface_r50_path: str = None
 
 
 @dataclass
