@@ -20,6 +20,7 @@ güvenilmez; dosya baştan sona sırayla okunur.
 """
 
 import os
+import shutil
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +31,10 @@ from tqdm.auto import tqdm
 _PREFIX_SZ = 8    # magic(4) + length(4)
 _IRHDR_SZ  = 24   # flag(4) + base_lbl(4) + id(8) + id2(8)
 
+# Disk dolmadan ÖNCE güvenli şekilde durmak için kaç görüntüde bir
+# `shutil.disk_usage` kontrolü yapılacağı (performans için her görüntüde değil).
+_DISK_CHECK_EVERY = 500
+
 
 def extract_ms1mv3(
     rec_path: str,
@@ -37,6 +42,7 @@ def extract_ms1mv3(
     max_per_id: int = 30,
     max_ids: int = 93000,
     skip_if_exists: bool = True,
+    min_free_gb: float = 2.0,
 ) -> dict:
     """
     MS1MV3 .rec dosyasını kimlik başına klasörlere ayrılmış JPEG'lere çıkarır.
@@ -47,23 +53,30 @@ def extract_ms1mv3(
         max_per_id:     kimlik başına maksimum görüntü sayısı
         max_ids:        işlenecek maksimum kimlik sayısı (class_id sınırı)
         skip_if_exists: extracted_dir zaten dolu ise atla
+        min_free_gb:    diskte bu kadar GB boş alan kalınca çıkarımı DURDUR
+                         (OSError: No space left on device çökmesini önler)
 
     Returns:
-        dict: {"n_ids": int, "n_images": int, "n_errors": int, "data_dir": str}
+        dict: {"n_ids": int, "n_images": int, "n_errors": int, "data_dir": str,
+               "stopped_early": bool}
     """
     if skip_if_exists and os.path.exists(extracted_dir) and len(list(Path(extracted_dir).iterdir())) > 0:
         n_ids = len(list(Path(extracted_dir).iterdir()))
         print(f"Zaten cikarilmis: {extracted_dir}  ({n_ids:,} kimlik)")
-        return {"n_ids": n_ids, "n_images": None, "n_errors": None, "data_dir": extracted_dir}
+        return {"n_ids": n_ids, "n_images": None, "n_errors": None,
+                "data_dir": extracted_dir, "stopped_early": False}
 
     os.makedirs(extracted_dir, exist_ok=True)
-    saved_total = 0
-    id_counts   = {}
-    errors      = 0
-    rec_idx     = 0
+    saved_total   = 0
+    id_counts     = {}
+    errors        = 0
+    rec_idx       = 0
+    stopped_early = False
+    min_free_bytes = min_free_gb * (1024 ** 3)
 
     file_size = os.path.getsize(rec_path)
     print(f"Rec dosyasi: {file_size / 1e9:.1f} GB — sequential okuma basliyor...")
+    print(f"Guvenlik: diskte {min_free_gb:.0f}GB kalinca otomatik duracak (crash yok).")
     print("Tahmini sure: ~3-5 dakika")
 
     with open(rec_path, "rb") as f:
@@ -117,6 +130,17 @@ def extract_ms1mv3(
                 if len(img_bytes) < 50:
                     continue
 
+                # Disk alanı kontrolü (her görüntüde değil, N'de bir — hızlı)
+                if saved_total % _DISK_CHECK_EVERY == 0:
+                    free_bytes = shutil.disk_usage(extracted_dir).free
+                    if free_bytes < min_free_bytes:
+                        stopped_early = True
+                        print(
+                            f"\n[DUR] Disk alani azaldi ({free_bytes / 1e9:.1f}GB kaldi, "
+                            f"esik={min_free_gb:.0f}GB). Cikarim guvenli sekilde durduruldu."
+                        )
+                        break
+
                 id_dir = os.path.join(extracted_dir, f"id_{label_id:06d}")
                 os.makedirs(id_dir, exist_ok=True)
                 try:
@@ -128,7 +152,7 @@ def extract_ms1mv3(
                     errors += 1
                     continue
 
-    print("\nTamamlandi!")
+    print("\nTamamlandi!" if not stopped_early else "\nDisk limiti nedeniyle erken durdu (veri kaybı yok).")
     print(f"  Kimlik  : {len(id_counts):,}")
     print(f"  Goruntu : {saved_total:,}")
     print(f"  Hata    : {errors:,}")
@@ -138,4 +162,5 @@ def extract_ms1mv3(
         "n_images": saved_total,
         "n_errors": errors,
         "data_dir": extracted_dir,
+        "stopped_early": stopped_early,
     }
