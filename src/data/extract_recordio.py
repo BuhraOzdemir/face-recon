@@ -39,10 +39,11 @@ _DISK_CHECK_EVERY = 500
 def extract_ms1mv3(
     rec_path: str,
     extracted_dir: str,
-    max_per_id: int = 30,
+    max_per_id: int = 15,
     max_ids: int = 93000,
     skip_if_exists: bool = True,
     min_free_gb: float = 2.0,
+    jpeg_quality: int = 90,
 ) -> dict:
     """
     MS1MV3 .rec dosyasını kimlik başına klasörlere ayrılmış JPEG'lere çıkarır.
@@ -50,11 +51,13 @@ def extract_ms1mv3(
     Args:
         rec_path:       .rec dosyasının yolu (örn. /kaggle/input/.../train.rec)
         extracted_dir:  çıktı klasörü (örn. /kaggle/working/ms1mv3_images)
-        max_per_id:     kimlik başına maksimum görüntü sayısı
+        max_per_id:     kimlik başına maksimum görüntü sayısı (varsayılan 15 —
+                         Kaggle'ın ~20GB disk kotasında TÜM 93K kimliği kapsar)
         max_ids:        işlenecek maksimum kimlik sayısı (class_id sınırı)
         skip_if_exists: extracted_dir zaten dolu ise atla
         min_free_gb:    diskte bu kadar GB boş alan kalınca çıkarımı DURDUR
                          (OSError: No space left on device çökmesini önler)
+        jpeg_quality:   kaydedilen JPEG kalitesi (disk tasarrufu icin 90)
 
     Returns:
         dict: {"n_ids": int, "n_images": int, "n_errors": int, "data_dir": str,
@@ -145,7 +148,7 @@ def extract_ms1mv3(
                 os.makedirs(id_dir, exist_ok=True)
                 try:
                     img = Image.open(BytesIO(img_bytes))
-                    img.save(os.path.join(id_dir, f"{cnt:04d}.jpg"), quality=95)
+                    img.save(os.path.join(id_dir, f"{cnt:04d}.jpg"), quality=jpeg_quality)
                     id_counts[label_id] = cnt + 1
                     saved_total += 1
                 except Exception:
