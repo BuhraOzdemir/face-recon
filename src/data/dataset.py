@@ -4,14 +4,18 @@ FaceDataset: Ön işlenmiş (aligned image + embedding) çiftlerini yükler.
 Ön koşul: src/data/preprocess.py çalıştırılmış ve manifest.txt oluşturulmuş olmalı.
 """
 
+import logging
+import random
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+
+log = logging.getLogger(__name__)
 
 
 # ─── Görüntü dönüşümleri ──────────────────────────────────────────────────────
@@ -41,11 +45,47 @@ def denormalize(tensor: torch.Tensor) -> torch.Tensor:
     return (tensor * 0.5 + 0.5).clamp(0, 1)
 
 
+# ─── Manifest okuma ────────────────────────────────────────────────────────────
+
+def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
+    """
+    manifest.txt'ten (img_path, emb_path, identity) üçlülerini okur.
+
+    identity: img_path'in üst klasör adı (örn. '.../id_048247/0007.jpg' → 'id_048247').
+    preprocess.py çıktısı bu yapıyı garanti eder — her kimlik kendi klasöründe.
+    """
+    manifest = Path(manifest_path)
+    if not manifest.exists():
+        raise FileNotFoundError(
+            f"Manifest bulunamadı: {manifest}\n"
+            "Önce 'src/data/preprocess.py' çalıştırın."
+        )
+
+    samples: List[Tuple[str, str, str]] = []
+    with open(manifest) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                continue
+            img_path, emb_path = parts
+            if Path(img_path).exists() and Path(emb_path).exists():
+                identity = Path(img_path).parent.name
+                samples.append((img_path, emb_path, identity))
+
+    if not samples:
+        raise ValueError(f"Manifest'te geçerli örnek bulunamadı: {manifest_path}")
+
+    return samples
+
+
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
 class FaceDataset(Dataset):
     """
-    manifest.txt'ten (img_path, emb_path) çiftlerini okur.
+    (img_path, emb_path, identity) listesinden yükleyen dataset.
 
     __getitem__ dönüşü:
         embedding: Tensor (512,)   float32
@@ -54,45 +94,21 @@ class FaceDataset(Dataset):
 
     def __init__(
         self,
-        manifest_path: str,
+        samples: List[Tuple[str, str, str]],
         transform: Optional[transforms.Compose] = None,
         image_size: int = 128,
     ):
+        self.samples   = samples
         self.transform = transform or build_train_transform(image_size)
-        self.samples: list[Tuple[str, str]] = []
-
-        manifest = Path(manifest_path)
-        if not manifest.exists():
-            raise FileNotFoundError(
-                f"Manifest bulunamadı: {manifest}\n"
-                "Önce 'src/data/preprocess.py' çalıştırın."
-            )
-
-        with open(manifest) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) != 2:
-                    continue
-                img_path, emb_path = parts
-                if Path(img_path).exists() and Path(emb_path).exists():
-                    self.samples.append((img_path, emb_path))
-
-        if not self.samples:
-            raise ValueError(f"Manifest'te geçerli örnek bulunamadı: {manifest_path}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_path, emb_path = self.samples[idx]
+        img_path, emb_path, _ = self.samples[idx]
 
-        # Embedding yükle
         embedding = torch.from_numpy(np.load(emb_path)).float()
 
-        # Görüntü yükle ve dönüştür
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
 
@@ -106,43 +122,59 @@ def build_dataloaders(
     image_size: int = 128,
     batch_size: int = 64,
     val_split: float = 0.05,
+    test_split: float = 0.05,
     num_workers: int = 4,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Train ve validation DataLoader'larını oluşturur.
+    Train / Validation / Test DataLoader'larını KİMLİK BAZLI olarak oluşturur.
 
-    Val split kimlik bazlı değil örnek bazlıdır (basitlik için).
-    Küçük veri setlerinde yeterli; büyük veri setlerinde kimlik bazlı split önerilir.
+    ÖNEMLİ: split örnek (görüntü) bazlı DEĞİL, kimlik bazlıdır — bir kimliğin
+    tüm görüntüleri yalnızca TEK bir split'te bulunur. Bu, model
+    değerlendirmesinde veri sızıntısını (leakage) önler: validation/test'te
+    görülen kişiler train'de asla görülmemiş olur (gerçek "görülmemiş yüz"
+    değerlendirmesi mümkün olur — Type-II identity skoru için gerekli).
+
+    Returns:
+        (train_loader, val_loader, test_loader)
+        test_loader eğitim döngüsünde KULLANILMAZ — yalnızca eğitim bittikten
+        sonra tek seferlik, nihai/bağımsız değerlendirme için ayrılmıştır.
     """
-    full_dataset = FaceDataset(
-        manifest_path=manifest_path,
-        transform=build_train_transform(image_size),
-        image_size=image_size,
-    )
+    all_samples = _load_manifest_samples(manifest_path)
 
-    n_total = len(full_dataset)
+    identities = sorted(set(s[2] for s in all_samples))
+    rng = random.Random(seed)
+    rng.shuffle(identities)
+
+    n_total = len(identities)
+    n_test  = max(1, int(n_total * test_split))
     n_val   = max(1, int(n_total * val_split))
-    n_train = n_total - n_val
+    n_train = n_total - n_val - n_test
 
-    train_ds, val_ds = random_split(
-        full_dataset,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(seed),
+    if n_train <= 0:
+        raise ValueError(
+            f"val_split ({val_split}) + test_split ({test_split}) çok yüksek: "
+            f"{n_total} kimlik için train'e hiç kimlik kalmadı. Oranları düşür."
+        )
+
+    train_ids = set(identities[:n_train])
+    val_ids   = set(identities[n_train:n_train + n_val])
+    test_ids  = set(identities[n_train + n_val:])
+
+    train_samples = [s for s in all_samples if s[2] in train_ids]
+    val_samples   = [s for s in all_samples if s[2] in val_ids]
+    test_samples  = [s for s in all_samples if s[2] in test_ids]
+
+    log.info(
+        f"Kimlik bazlı split — "
+        f"train: {len(train_ids):,} kimlik / {len(train_samples):,} görüntü | "
+        f"val: {len(val_ids):,} kimlik / {len(val_samples):,} görüntü | "
+        f"test: {len(test_ids):,} kimlik / {len(test_samples):,} görüntü"
     )
 
-    # Val için augmentation kapalı transform
-    val_ds.dataset = FaceDataset(
-        manifest_path=manifest_path,
-        transform=build_val_transform(image_size),
-        image_size=image_size,
-    )
-    # NOT: random_split, dataset'i sarmalıyor, sadece indeksleri böler.
-    # Val transform'u doğrudan uygulamak için Subset wrapper kullanıyoruz:
-    train_ds = _TransformSubset(full_dataset, train_ds.indices,
-                                 build_train_transform(image_size))
-    val_ds   = _TransformSubset(full_dataset, val_ds.indices,
-                                 build_val_transform(image_size))
+    train_ds = FaceDataset(train_samples, build_train_transform(image_size), image_size)
+    val_ds   = FaceDataset(val_samples,   build_val_transform(image_size),   image_size)
+    test_ds  = FaceDataset(test_samples,  build_val_transform(image_size),  image_size)
 
     train_loader = DataLoader(
         train_ds,
@@ -162,27 +194,14 @@ def build_dataloaders(
         drop_last=False,
         persistent_workers=(num_workers > 0),
     )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+    )
 
-    return train_loader, val_loader
-
-
-class _TransformSubset(Dataset):
-    """Subset'e özel transform uygulayan yardımcı sınıf."""
-
-    def __init__(self, source_dataset: FaceDataset, indices: list, transform: transforms.Compose):
-        self.source    = source_dataset
-        self.indices   = indices
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        real_idx = self.indices[idx]
-        img_path, emb_path = self.source.samples[real_idx]
-
-        embedding = torch.from_numpy(np.load(emb_path)).float()
-        image = Image.open(img_path).convert("RGB")
-        image = self.transform(image)
-
-        return embedding, image
+    return train_loader, val_loader, test_loader

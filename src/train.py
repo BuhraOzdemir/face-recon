@@ -168,14 +168,19 @@ def train(
     if manifest_path is None:
         manifest_path = str(Path(cfg.data.processed_dir) / "manifest.txt")
 
-    train_loader, val_loader = build_dataloaders(
+    train_loader, val_loader, test_loader = build_dataloaders(
         manifest_path=manifest_path,
         image_size=cfg.data.image_size,
         batch_size=cfg.train.batch_size,
         val_split=cfg.data.val_split,
+        test_split=cfg.data.test_split,
         num_workers=cfg.data.num_workers,
     )
-    log.info(f"Train: {len(train_loader.dataset):,}  |  Val: {len(val_loader.dataset):,}")
+    log.info(
+        f"Train: {len(train_loader.dataset):,}  |  "
+        f"Val: {len(val_loader.dataset):,}  |  "
+        f"Test: {len(test_loader.dataset):,} (eğitimde kullanılmaz, nihai değerlendirme için)"
+    )
 
     # ── Model ──────────────────────────────────────────────────
     model = FaceDecoder(
@@ -338,11 +343,41 @@ def train(
             )
             break
 
+    # ── Nihai Test Değerlendirmesi (tek seferlik, hiç görülmemiş kimlikler) ──
+    # test_loader ne egitimde ne de checkpoint seciminde kullanildi — bu yuzden
+    # buradaki skor, modelin gercekten GORULMEMIS yuzlerdeki performansini
+    # (Type-II identity preservation) yansitir.
+    best_ckpt = Path(cfg.train.save_dir) / "best_model.pt"
+    if best_ckpt.exists():
+        state = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(state["model"])
+    model.eval()
+
+    test_id_scores = []
+    with torch.no_grad():
+        for emb_b, real_b in test_loader:
+            emb_b  = emb_b.to(device)
+            real_b = real_b.to(device)
+            gen_b  = model(emb_b)
+            losses = loss_fn(gen_b, real_b, cfg.loss.phase3_weights)
+            test_id_scores.append(1.0 - losses["identity"].item())
+            if evaluator is not None:
+                indep_score = evaluator.cosine_sim(gen_b, real_b)
+                writer.add_scalar("test/independent_cosine_sim", indep_score.item())
+
+    if test_id_scores:
+        test_mean = sum(test_id_scores) / len(test_id_scores)
+        log.info(
+            f"[NİHAİ TEST] {len(test_loader.dataset):,} görülmemiş görüntü — "
+            f"identity_similarity={test_mean:.4f}"
+        )
+        writer.add_scalar("test/identity_similarity", test_mean, 0)
+
     writer.close()
     log.info(f"Eğitim tamamlandı. En iyi val identity score: {best_val_score:.4f}")
 
     # Best model yolunu döndür
-    return str(Path(cfg.train.save_dir) / "best_model.pt")
+    return str(best_ckpt)
 
 
 if __name__ == "__main__":

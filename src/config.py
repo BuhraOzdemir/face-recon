@@ -20,8 +20,12 @@ class DataConfig:
     align_size: int = 112          # insightface hizalama boyutu (sonra resize edilir)
     embedding_dim: int = 512       # ArcFace embedding boyutu
 
-    # Eğitim/val split oranı (kimlik bazlı)
+    # Train/Val/Test split oranları — KİMLİK BAZLI (örnek/görüntü bazlı değil).
+    # Bir kimliğin tüm görüntüleri yalnızca TEK bir split'te bulunur; bu,
+    # val/test'te görülen kişilerin train'de asla görülmemesini garantiler
+    # (veri sızıntısını / leakage'ı önler).
     val_split: float = 0.05        # Kimliklerin %5'i validasyon için ayrılır
+    test_split: float = 0.05       # Kimliklerin %5'i final test için ayrılır (eğitimde kullanılmaz)
     num_workers: int = 4
 
 
