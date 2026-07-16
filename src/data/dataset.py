@@ -1,9 +1,16 @@
 """
 FaceDataset: Ön işlenmiş (aligned image + embedding) çiftlerini yükler.
 
-Ön koşul: src/data/preprocess.py çalıştırılmış ve manifest.txt oluşturulmuş olmalı.
+Manifest satırı:
+    img_uri\\temb_uri
+
+URI düz dosya yolu olabilir veya tar member:
+    /path/shard_000001.tar::000042/00003.jpg
 """
 
+from __future__ import annotations
+
+import io
 import logging
 import random
 from pathlib import Path
@@ -12,8 +19,16 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+from .tar_shards import (
+    TarMemberCache,
+    identity_from_member,
+    parse_uri,
+    read_uri_bytes,
+    uri_exists,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,9 +40,8 @@ def build_train_transform(image_size: int = 128) -> transforms.Compose:
         transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-        transforms.ToTensor(),                          # [0, 1]
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],     # [-1, 1]
-                             std=[0.5, 0.5, 0.5]),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
 
@@ -35,8 +49,7 @@ def build_val_transform(image_size: int = 128) -> transforms.Compose:
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
 
@@ -47,12 +60,18 @@ def denormalize(tensor: torch.Tensor) -> torch.Tensor:
 
 # ─── Manifest okuma ────────────────────────────────────────────────────────────
 
+def _identity_from_uri(uri: str) -> str:
+    tar_path, member = parse_uri(uri)
+    if tar_path is not None:
+        return identity_from_member(member)
+    return Path(member).parent.name
+
+
 def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
     """
-    manifest.txt'ten (img_path, emb_path, identity) üçlülerini okur.
+    manifest.txt'ten (img_uri, emb_uri, identity) üçlülerini okur.
 
-    identity: img_path'in üst klasör adı (örn. '.../id_048247/0007.jpg' → 'id_048247').
-    preprocess.py çıktısı bu yapıyı garanti eder — her kimlik kendi klasöründe.
+    identity: tar member klasöründen veya dosya yolunun üst klasöründen.
     """
     manifest = Path(manifest_path)
     if not manifest.exists():
@@ -70,10 +89,10 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
             parts = line.split("\t")
             if len(parts) != 2:
                 continue
-            img_path, emb_path = parts
-            if Path(img_path).exists() and Path(emb_path).exists():
-                identity = Path(img_path).parent.name
-                samples.append((img_path, emb_path, identity))
+            img_uri, emb_uri = parts
+            if uri_exists(img_uri) and uri_exists(emb_uri):
+                identity = _identity_from_uri(img_uri)
+                samples.append((img_uri, emb_uri, identity))
 
     if not samples:
         raise ValueError(f"Manifest'te geçerli örnek bulunamadı: {manifest_path}")
@@ -85,11 +104,11 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
 
 class FaceDataset(Dataset):
     """
-    (img_path, emb_path, identity) listesinden yükleyen dataset.
+    (img_uri, emb_uri, identity) listesinden yükleyen dataset.
 
     __getitem__ dönüşü:
-        embedding: Tensor (512,)   float32
-        image:     Tensor (3, H, W) float32 — [-1, 1] normalize
+        embedding: Tensor (512,)
+        image:     Tensor (3, H, W) — [-1, 1]
     """
 
     def __init__(
@@ -98,18 +117,30 @@ class FaceDataset(Dataset):
         transform: Optional[transforms.Compose] = None,
         image_size: int = 128,
     ):
-        self.samples   = samples
+        self.samples = samples
         self.transform = transform or build_train_transform(image_size)
+        # DataLoader worker'larında lazy init (process-local)
+        self._cache: Optional[TarMemberCache] = None
+
+    def _get_cache(self) -> TarMemberCache:
+        if self._cache is None:
+            self._cache = TarMemberCache()
+        return self._cache
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_path, emb_path, _ = self.samples[idx]
+        img_uri, emb_uri, _ = self.samples[idx]
+        cache = self._get_cache()
 
-        embedding = torch.from_numpy(np.load(emb_path)).float()
+        emb_bytes = read_uri_bytes(emb_uri, cache=cache)
+        embedding = torch.from_numpy(
+            np.load(io.BytesIO(emb_bytes), allow_pickle=False)
+        ).float()
 
-        image = Image.open(img_path).convert("RGB")
+        img_bytes = read_uri_bytes(img_uri, cache=cache)
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         image = self.transform(image)
 
         return embedding, image
@@ -129,16 +160,8 @@ def build_dataloaders(
     """
     Train / Validation / Test DataLoader'larını KİMLİK BAZLI olarak oluşturur.
 
-    ÖNEMLİ: split örnek (görüntü) bazlı DEĞİL, kimlik bazlıdır — bir kimliğin
-    tüm görüntüleri yalnızca TEK bir split'te bulunur. Bu, model
-    değerlendirmesinde veri sızıntısını (leakage) önler: validation/test'te
-    görülen kişiler train'de asla görülmemiş olur (gerçek "görülmemiş yüz"
-    değerlendirmesi mümkün olur — Type-II identity skoru için gerekli).
-
-    Returns:
-        (train_loader, val_loader, test_loader)
-        test_loader eğitim döngüsünde KULLANILMAZ — yalnızca eğitim bittikten
-        sonra tek seferlik, nihai/bağımsız değerlendirme için ayrılmıştır.
+    Split örnek bazlı DEĞİL, kimlik bazlıdır — bir kimliğin tüm görüntüleri
+    yalnızca TEK bir split'te bulunur.
     """
     all_samples = _load_manifest_samples(manifest_path)
 
@@ -147,8 +170,8 @@ def build_dataloaders(
     rng.shuffle(identities)
 
     n_total = len(identities)
-    n_test  = max(1, int(n_total * test_split))
-    n_val   = max(1, int(n_total * val_split))
+    n_test = max(1, int(n_total * test_split))
+    n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val - n_test
 
     if n_train <= 0:
@@ -158,12 +181,12 @@ def build_dataloaders(
         )
 
     train_ids = set(identities[:n_train])
-    val_ids   = set(identities[n_train:n_train + n_val])
-    test_ids  = set(identities[n_train + n_val:])
+    val_ids = set(identities[n_train:n_train + n_val])
+    test_ids = set(identities[n_train + n_val:])
 
     train_samples = [s for s in all_samples if s[2] in train_ids]
-    val_samples   = [s for s in all_samples if s[2] in val_ids]
-    test_samples  = [s for s in all_samples if s[2] in test_ids]
+    val_samples = [s for s in all_samples if s[2] in val_ids]
+    test_samples = [s for s in all_samples if s[2] in test_ids]
 
     log.info(
         f"Kimlik bazlı split — "
@@ -173,8 +196,8 @@ def build_dataloaders(
     )
 
     train_ds = FaceDataset(train_samples, build_train_transform(image_size), image_size)
-    val_ds   = FaceDataset(val_samples,   build_val_transform(image_size),   image_size)
-    test_ds  = FaceDataset(test_samples,  build_val_transform(image_size),  image_size)
+    val_ds = FaceDataset(val_samples, build_val_transform(image_size), image_size)
+    test_ds = FaceDataset(test_samples, build_val_transform(image_size), image_size)
 
     train_loader = DataLoader(
         train_ds,
