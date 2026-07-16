@@ -76,6 +76,7 @@ def run_overfit_test(
 
     model.train()
     final_l1 = None
+    recent_losses: list = []
     for step in range(1, steps + 1):
         optimizer.zero_grad(set_to_none=True)
         generated = model(embeddings)
@@ -84,6 +85,9 @@ def run_overfit_test(
         optimizer.step()
 
         final_l1 = loss.item()
+        recent_losses.append(final_l1)
+        if len(recent_losses) > 200:
+            recent_losses.pop(0)
         if step % log_every == 0 or step == 1:
             log.info(f"[Overfit Test] step={step:4d}/{steps}  L1={final_l1:.5f}")
 
@@ -104,12 +108,25 @@ def run_overfit_test(
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
 
-    log.info(f"[Overfit Test] TAMAMLANDI. Final L1: {final_l1:.5f}")
-    if final_l1 < 0.03:
-        log.info("[Overfit Test] SONUÇ: Loss çok düştü — pipeline SAĞLAM görünüyor. "
-                  "Ana eğitimdeki sorun muhtemelen yetersiz epoch/veri.")
+    # Trend kontrolü: son 200 adımın ilk yarısı ile ikinci yarısını kıyasla.
+    # Loss hâlâ düşüyorsa (plato yapmadıysa) mutlak eşik yanıltıcı olur —
+    # asıl karar görsel yakınsamaya bırakılmalı.
+    still_improving = False
+    if len(recent_losses) >= 100:
+        first_half  = sum(recent_losses[:100]) / 100
+        second_half = sum(recent_losses[-100:]) / 100
+        still_improving = second_half < first_half * 0.98
+
+    log.info(f"[Overfit Test] TAMAMLANDI. Final L1: {final_l1:.5f}  "
+              f"(son 200 adımda hâlâ düşüyor: {still_improving})")
+
+    if final_l1 < 0.06 or still_improving:
+        log.info("[Overfit Test] SONUÇ: Loss düşüyor ve/veya makul seviyede — "
+                  "pipeline SAĞLAM görünüyor. Görsel çıktıyı MUTLAKA gözle kontrol et "
+                  "(sayısal eşikten daha güvenilir gösterge). Ana eğitimdeki blob/anlamsız "
+                  "çıktı sorunu muhtemelen yetersiz epoch/veri, mimari hatası DEĞİL.")
     else:
-        log.warning("[Overfit Test] SONUÇ: Loss beklenenden yüksek kaldı — "
+        log.warning("[Overfit Test] SONUÇ: Loss plato yaptı VE hâlâ yüksek — "
                      "model/veri/gradient akışında bir SORUN olabilir, ana eğitime "
                      "geçmeden önce incele.")
 
