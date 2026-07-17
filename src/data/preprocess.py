@@ -42,12 +42,21 @@ from .tar_shards import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
+# resource_ok her ornekte degil, bu kadar ornekte bir kontrol edilir
+# (extract_recordio.py'daki _RESOURCE_CHECK_EVERY ile tutarli).
+_RESOURCE_CHECK_EVERY = 500
+
 
 def load_insightface_app(det_size=(320, 320)):
     """
     insightface FaceAnalysis uygulamasını yükle.
 
     buffalo_s: MobileFaceNet backbone, 512-dim embedding.
+
+    allowed_modules ile yalnizca detection + recognition yuklenir;
+    genderage ve landmark_3d_68 kullanilmadigi icin (hizalama zaten
+    face.kps / face_align.norm_crop ile _manual_align icinde yapiliyor)
+    bu modellerin forward pass'i atlanip goruntu basina sure dusurulur.
     """
     import insightface
     from insightface.app import FaceAnalysis
@@ -55,6 +64,7 @@ def load_insightface_app(det_size=(320, 320)):
     app = FaceAnalysis(
         name="buffalo_s",
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        allowed_modules=["detection", "recognition"],
     )
     app.prepare(ctx_id=0, det_size=det_size)
     return app
@@ -206,12 +216,13 @@ def preprocess_dataset(
     stopped_early = False
 
     try:
-        for kind, source, stem in tqdm(samples, desc="On isleme"):
-            ok, reason = resource_ok(str(shards_out), min_free_gb, min_free_inodes)
-            if not ok:
-                stopped_early = True
-                log.warning(f"Kaynak azaldi ({reason}) — preprocess durduruldu.")
-                break
+        for i, (kind, source, stem) in enumerate(tqdm(samples, desc="On isleme")):
+            if i % _RESOURCE_CHECK_EVERY == 0:
+                ok, reason = resource_ok(str(shards_out), min_free_gb, min_free_inodes)
+                if not ok:
+                    stopped_early = True
+                    log.warning(f"Kaynak azaldi ({reason}) — preprocess durduruldu.")
+                    break
 
             try:
                 if kind == "shard":
