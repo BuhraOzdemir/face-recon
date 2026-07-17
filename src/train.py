@@ -7,12 +7,13 @@ Colab'da doğrudan import edilebilir veya bağımsız çalıştırılabilir.
 import os
 import logging
 import shutil
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
@@ -25,6 +26,15 @@ from .models.losses import ReconstructionLoss
 from .models.evaluator import IndependentEvaluator
 
 log = logging.getLogger(__name__)
+
+# GPU'yu maksimum verimle kullanmak icin: sabit input boyutlarinda
+# cuDNN en hizli algoritmayi arayip cache'ler (ilk birkac step yavas,
+# sonrasi hizlanir). image_size sabit oldugu icin bu guvenli.
+torch.backends.cudnn.benchmark = True
+# TF32 matmul/conv - T4 (Turing, sm_75) icin gecerli, hassasiyet kaybi
+# ihmal edilebilir duzeyde, throughput'u belirgin artirir.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # ─── Checkpoint yönetimi ──────────────────────────────────────────────────────
@@ -114,22 +124,42 @@ def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
+    """
+    NOT: checkpoint/"en iyi model" karari icin kullanilan identity skoru,
+    egitim fazindan BAGIMSIZ sabit bir agirlikla (identity=1.0) ayrica
+    hesaplaniyor. Aksi halde faz1'de weights['identity']=0 oldugu icin
+    "1 - agirlikli_identity_loss" her zaman 1.0 cikar ve en iyi model
+    secimi faz1 sonunda kalici olarak kilitlenir (faz2/3'te asilamaz).
+
+    UYARI: loss_fn(...).identity'nin AGIRLIKLI mi HAM mi dondugu
+    losses.py'ye bakilmadan %100 teyit edilemedi — losses.py paylasilinca
+    bu fonksiyon gerekirse ince ayar yapilacak.
+    """
     model.eval()
     total_losses: Dict[str, float] = {}
+    identity_raw_sum = 0.0
     n_batches = 0
 
+    eval_weights = dict(weights)
+    eval_weights["identity"] = 1.0  # checkpoint karari icin sabit agirlik
+
+    generated = None
+    real_imgs = None
     for embeddings, real_imgs in val_loader:
-        embeddings = embeddings.to(device)
-        real_imgs  = real_imgs.to(device)
+        embeddings = embeddings.to(device, non_blocking=True)
+        real_imgs  = real_imgs.to(device, non_blocking=True)
 
         generated = model(embeddings)
-        losses    = loss_fn(generated, real_imgs, weights)
+        losses      = loss_fn(generated, real_imgs, weights)
+        eval_losses = loss_fn(generated, real_imgs, eval_weights)
 
         for k, v in losses.items():
             total_losses[k] = total_losses.get(k, 0.0) + v.item()
+        identity_raw_sum += eval_losses["identity"].item()
         n_batches += 1
 
     avg = {k: v / n_batches for k, v in total_losses.items()}
+    avg["identity_score"] = identity_raw_sum / n_batches  # dusuk = iyi (loss)
 
     if writer:
         for k, v in avg.items():
@@ -163,6 +193,8 @@ def train(
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Cihaz: {device}")
+    if device.type == "cuda":
+        log.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # ── DataLoader ─────────────────────────────────────────────
     if manifest_path is None:
@@ -189,6 +221,10 @@ def train(
         initial_channels=cfg.model.initial_channels,
         decoder_channels=cfg.model.decoder_channels,
     ).to(device)
+    # channels_last, conv-agirlikli modellerde Tensor Core kullanimini
+    # artirip GPU throughput'unu yukseltir (T4/Turing destekliyor).
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
 
     info = model.count_parameters()
     log.info(f"Model: {info['total_params']:,} parametre | {info['float32_mb']} MB (float32)")
@@ -218,11 +254,11 @@ def train(
         weight_decay=cfg.train.weight_decay,
     )
     scheduler = build_scheduler(optimizer, cfg)
-    scaler    = GradScaler(enabled=cfg.train.use_amp)
+    scaler    = GradScaler("cuda", enabled=cfg.train.use_amp)
 
     # ── Resume ─────────────────────────────────────────────────
     start_epoch    = 0
-    best_val_score = 0.0   # Identity cosine similarity (yüksek = iyi)
+    best_val_score = float("inf")  # identity RAW LOSS - dusuk = iyi (bkz. validate() notu)
     patience_ctr   = 0
 
     if resume_from and Path(resume_from).exists():
@@ -245,6 +281,10 @@ def train(
         for step, (embeddings, real_imgs) in enumerate(train_loader):
             embeddings = embeddings.to(device, non_blocking=True)
             real_imgs  = real_imgs.to(device, non_blocking=True)
+            if device.type == "cuda":
+                embeddings = embeddings.contiguous(memory_format=torch.channels_last) \
+                    if embeddings.dim() == 4 else embeddings
+                real_imgs  = real_imgs.contiguous(memory_format=torch.channels_last)
 
             # Transport simulation: INT8 roundtrip (PDF v2.0 §6.3)
             if cfg.train.transport_simulate:
@@ -252,7 +292,7 @@ def train(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=cfg.train.use_amp):
+            with autocast("cuda", enabled=cfg.train.use_amp):
                 generated = model(embeddings)
                 losses    = loss_fn(generated, real_imgs, weights)
 
@@ -284,12 +324,12 @@ def train(
 
         # ── Validation ─────────────────────────────────────────
         val_losses = validate(model, loss_fn, val_loader, device, weights, writer, epoch)
-        val_id_score = 1.0 - val_losses.get("identity", 1.0)  # yüksek = iyi
+        val_id_score = val_losses["identity_score"]  # RAW loss, dusuk = iyi
 
         log.info(
             f"[Val] epoch={epoch+1}  "
             f"total={val_losses['total']:.4f}  "
-            f"identity_similarity={val_id_score:.4f}  "
+            f"identity_score(raw_loss, dusuk_iyi)={val_id_score:.4f}  "
             f"best={best_val_score:.4f}"
         )
 
@@ -312,7 +352,8 @@ def train(
             model.train()
 
         # ── Checkpoint ─────────────────────────────────────────
-        is_best = val_id_score > best_val_score + cfg.train.min_delta
+        # RAW identity LOSS kullanildigi icin kriter tersine dondu: dusuk = iyi.
+        is_best = val_id_score < best_val_score - cfg.train.min_delta
         if is_best:
             best_val_score = val_id_score
             patience_ctr   = 0
@@ -327,7 +368,11 @@ def train(
                     "optimizer":      optimizer.state_dict(),
                     "scheduler":      scheduler.state_dict(),
                     "best_val_score": best_val_score,
-                    "config":         cfg,
+                    # cfg dataclass'i ham haliyle pickle edilirse, modul
+                    # yeniden yuklendiginde (git clone tekrar calisinca)
+                    # sinif kimligi degisip PicklingError verir. dict'e
+                    # cevirerek bu riski tamamen ortadan kaldiriyoruz.
+                    "config": asdict(cfg) if is_dataclass(cfg) else cfg,
                 },
                 save_dir=cfg.train.save_dir,
                 epoch=epoch + 1,
@@ -339,14 +384,11 @@ def train(
         if patience_ctr >= cfg.train.patience:
             log.info(
                 f"Early stopping: {cfg.train.patience} epoch boyunca "
-                f"val identity score artmadı. Son score: {best_val_score:.4f}"
+                f"val identity score iyilesmedi. Son score: {best_val_score:.4f}"
             )
             break
 
     # ── Nihai Test Değerlendirmesi (tek seferlik, hiç görülmemiş kimlikler) ──
-    # test_loader ne egitimde ne de checkpoint seciminde kullanildi — bu yuzden
-    # buradaki skor, modelin gercekten GORULMEMIS yuzlerdeki performansini
-    # (Type-II identity preservation) yansitir.
     best_ckpt = Path(cfg.train.save_dir) / "best_model.pt"
     if best_ckpt.exists():
         state = torch.load(best_ckpt, map_location=device)
@@ -374,7 +416,7 @@ def train(
         writer.add_scalar("test/identity_similarity", test_mean, 0)
 
     writer.close()
-    log.info(f"Eğitim tamamlandı. En iyi val identity score: {best_val_score:.4f}")
+    log.info(f"Eğitim tamamlandı. En iyi val identity score (raw loss): {best_val_score:.4f}")
 
     # Best model yolunu döndür
     return str(best_ckpt)
