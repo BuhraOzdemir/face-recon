@@ -21,6 +21,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from concurrent.futures import ThreadPoolExecutor
 
 from .tar_shards import (
     TarMemberCache,
@@ -72,6 +73,12 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
     manifest.txt'ten (img_uri, emb_uri, identity) üçlülerini okur.
 
     identity: tar member klasöründen veya dosya yolunun üst klasöründen.
+
+    Not: exists() kontrolu /kaggle/input gibi FUSE-tabanli salt-okunur
+    mount'larda dosya basina birkaç ms surebiliyor; yuzbinlerce satirda
+    bu tek-thread'li kontrolu onlarca dakikaya cikariyor. ThreadPoolExecutor
+    ile I/O-bound bu kontrolleri paralellestiriyoruz (GIL, I/O bekleme
+    sirasinda serbest kaldigi icin bu gercek bir hizlanma saglar).
     """
     manifest = Path(manifest_path)
     if not manifest.exists():
@@ -80,7 +87,7 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
             "Önce 'src/data/preprocess.py' çalıştırın."
         )
 
-    samples: List[Tuple[str, str, str]] = []
+    lines: List[Tuple[str, str]] = []
     with open(manifest) as f:
         for line in f:
             line = line.strip()
@@ -89,10 +96,20 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
             parts = line.split("\t")
             if len(parts) != 2:
                 continue
-            img_uri, emb_uri = parts
-            if uri_exists(img_uri) and uri_exists(emb_uri):
-                identity = _identity_from_uri(img_uri)
-                samples.append((img_uri, emb_uri, identity))
+            lines.append((parts[0], parts[1]))
+
+    def _check(pair):
+        img_uri, emb_uri = pair
+        if uri_exists(img_uri) and uri_exists(emb_uri):
+            identity = _identity_from_uri(img_uri)
+            return (img_uri, emb_uri, identity)
+        return None
+
+    samples: List[Tuple[str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        for result in executor.map(_check, lines):
+            if result is not None:
+                samples.append(result)
 
     if not samples:
         raise ValueError(f"Manifest'te geçerli örnek bulunamadı: {manifest_path}")

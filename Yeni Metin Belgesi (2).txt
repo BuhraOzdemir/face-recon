@@ -1,0 +1,8 @@
+
+22143.6s    28256    INFO: [Val] epoch=5  total=22.1985  identity_score(raw_loss, dusuk_iyi)=0.3039  best=0.3518
+
+26630.0s    28823    INFO: [Val] epoch=6  total=21.9151  identity_score(raw_loss, dusuk_iyi)=0.2813  best=0.3039
+
+INFO: [Val] epoch=7  total=21.6636  identity_score(raw_loss, dusuk_iyi)=0.2607  best=0.2813
+
+39804.3s	30515	INFO: [Val] epoch=9  total=21.4276  identity_score(raw_loss, dusuk_iyi)=0.2471  best=0.2510
