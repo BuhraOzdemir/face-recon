@@ -13,6 +13,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -22,17 +23,13 @@ from torchvision.utils import make_grid
 from .config import Config, DEFAULT_CONFIG
 from .data.dataset import build_dataloaders, denormalize
 from .models.decoder import FaceDecoder
+from .models.discriminator import PatchDiscriminator
 from .models.losses import ReconstructionLoss
 from .models.evaluator import IndependentEvaluator
 
 log = logging.getLogger(__name__)
 
-# GPU'yu maksimum verimle kullanmak icin: sabit input boyutlarinda
-# cuDNN en hizli algoritmayi arayip cache'ler (ilk birkac step yavas,
-# sonrasi hizlanir). image_size sabit oldugu icin bu guvenli.
 torch.backends.cudnn.benchmark = True
-# TF32 matmul/conv - T4 (Turing, sm_75) icin gecerli, hassasiyet kaybi
-# ihmal edilebilir duzeyde, throughput'u belirgin artirir.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -57,18 +54,36 @@ def save_checkpoint(
         shutil.copyfile(ckpt_file, best_file)
         log.info(f"[Best] {best_file}")
 
-    # Eski checkpoint'leri temizle
     ckpts = sorted(save_path.glob("checkpoint_epoch*.pt"))
     for old in ckpts[:-keep_last_n]:
         old.unlink()
 
 
-def load_checkpoint(model: nn.Module, optimizer, scheduler, ckpt_path: str, device: torch.device):
+def load_checkpoint(
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    ckpt_path: str,
+    device: torch.device,
+    discriminator: Optional[nn.Module] = None,
+    disc_optimizer=None,
+):
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
     if scheduler and "scheduler" in state:
         scheduler.load_state_dict(state["scheduler"])
+
+    if discriminator is not None:
+        if state.get("discriminator") is not None:
+            discriminator.load_state_dict(state["discriminator"])
+            log.info("[GAN] Discriminator checkpoint'ten yuklendi.")
+        else:
+            log.info("[GAN] Checkpoint'te discriminator yok - sifirdan baslatiliyor.")
+
+    if disc_optimizer is not None and state.get("disc_optimizer") is not None:
+        disc_optimizer.load_state_dict(state["disc_optimizer"])
+
     start_epoch     = state["epoch"] + 1
     best_val_score  = state.get("best_val_score", 0.0)
     log.info(f"Checkpoint yüklendi: epoch={state['epoch']}, best_score={best_val_score:.4f}")
@@ -96,19 +111,21 @@ def build_scheduler(optimizer, cfg: Config):
     )
 
 
+# ─── GAN yardımcıları ──────────────────────────────────────────────────────────
+
+def _current_adv_weight(cfg: Config, epoch: int) -> float:
+    """GAN devreye girdikten sonra adv_weight'i lineer olarak 0'dan tavana çıkar."""
+    start = cfg.train.gan_start_epoch
+    ramp = max(1, cfg.train.adv_weight_ramp_epochs)
+    if epoch < start:
+        return 0.0
+    progress = min(1.0, (epoch - start + 1) / ramp)
+    return cfg.train.adv_weight * progress
+
+
 # ─── Transport Simulation (INT8 Roundtrip) ────────────────────────────────────
 
 def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
-    """
-    INT8 quantization-dequantization roundtrip'ini simüle eder (PDF v2.0 §6.3).
-
-    Deployment sırasında embedding QR koddan uint8 olarak gelir ve
-    float32'ye dönüştürülür. Bu dönüşüm, küçük bir quantization gürültüsü
-    ekler. Eğitimde bu gürültüyü simüle ederek domain gap'i kapatırız.
-
-    Yalnızca embedding giriş tensörüne uygulanır; decoder parametrelerine değil.
-    Gradient geçirmez (detach sonra yeniden attach → Straight-Through Estimator).
-    """
     with torch.no_grad():
         e_min = embeddings.min(dim=1, keepdim=True).values
         e_max = embeddings.max(dim=1, keepdim=True).values
@@ -116,7 +133,6 @@ def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
         quantized   = torch.round((embeddings - e_min) / scale).clamp(0, 255)
         dequantized = quantized * scale + e_min
 
-    # Straight-Through Estimator: gradient'i orijinal tensörden geçir
     return embeddings + (dequantized - embeddings).detach()
 
 
@@ -125,15 +141,11 @@ def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
     """
-    NOT: checkpoint/"en iyi model" karari icin kullanilan identity skoru,
-    egitim fazindan BAGIMSIZ sabit bir agirlikla (identity=1.0) ayrica
+    NOT: checkpoint karari icin kullanilan identity skoru, egitim
+    fazindan BAGIMSIZ sabit bir agirlikla (identity=1.0) ayrica
     hesaplaniyor. Aksi halde faz1'de weights['identity']=0 oldugu icin
-    "1 - agirlikli_identity_loss" her zaman 1.0 cikar ve en iyi model
-    secimi faz1 sonunda kalici olarak kilitlenir (faz2/3'te asilamaz).
-
-    UYARI: loss_fn(...).identity'nin AGIRLIKLI mi HAM mi dondugu
-    losses.py'ye bakilmadan %100 teyit edilemedi — losses.py paylasilinca
-    bu fonksiyon gerekirse ince ayar yapilacak.
+    identity loss hep 0 cikar ve en iyi model secimi faz1 sonunda
+    kalici olarak kilitlenir.
     """
     model.eval()
     total_losses: Dict[str, float] = {}
@@ -141,7 +153,7 @@ def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
     n_batches = 0
 
     eval_weights = dict(weights)
-    eval_weights["identity"] = 1.0  # checkpoint karari icin sabit agirlik
+    eval_weights["identity"] = 1.0
 
     generated = None
     real_imgs = None
@@ -159,13 +171,12 @@ def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
         n_batches += 1
 
     avg = {k: v / n_batches for k, v in total_losses.items()}
-    avg["identity_score"] = identity_raw_sum / n_batches  # dusuk = iyi (loss)
+    avg["identity_score"] = identity_raw_sum / n_batches
 
     if writer:
         for k, v in avg.items():
             writer.add_scalar(f"val/{k}", v, epoch)
 
-        # İlk batch'ten görselleştirme
         real_grid = make_grid(denormalize(real_imgs[:8]), nrow=4)
         gen_grid  = make_grid(denormalize(generated[:8]), nrow=4)
         writer.add_image("val/real",      real_grid, epoch)
@@ -182,14 +193,6 @@ def train(
     manifest_path: Optional[str] = None,
     resume_from: Optional[str] = None,
 ):
-    """
-    Ana eğitim fonksiyonu.
-
-    Args:
-        cfg:           Config nesnesi. Varsayılan: DEFAULT_CONFIG.
-        manifest_path: processed/manifest.txt yolu. Yoksa cfg.data.processed_dir kullanılır.
-        resume_from:   Devam edilecek checkpoint dosyası.
-    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Cihaz: {device}")
@@ -221,13 +224,33 @@ def train(
         initial_channels=cfg.model.initial_channels,
         decoder_channels=cfg.model.decoder_channels,
     ).to(device)
-    # channels_last, conv-agirlikli modellerde Tensor Core kullanimini
-    # artirip GPU throughput'unu yukseltir (T4/Turing destekliyor).
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
     info = model.count_parameters()
     log.info(f"Model: {info['total_params']:,} parametre | {info['float32_mb']} MB (float32)")
+
+    # ── Discriminator (SADECE egitimde; export'a dahil edilmez) ──
+    discriminator = None
+    disc_optimizer = None
+    disc_scaler = None
+    if cfg.train.use_gan:
+        discriminator = PatchDiscriminator().to(device)
+        disc_optimizer = AdamW(
+            discriminator.parameters(),
+            lr=cfg.train.disc_lr,
+            betas=cfg.train.adam_betas,
+        )
+        disc_scaler = GradScaler("cuda", enabled=cfg.train.use_amp)
+        d_info = discriminator.count_parameters()
+        log.info(
+            f"[GAN] Discriminator: {d_info['total_params']:,} parametre "
+            f"({d_info['float32_mb']} MB) — SADECE egitimde kullanilir, export edilmez."
+        )
+        log.info(
+            f"[GAN] gan_start_epoch={cfg.train.gan_start_epoch}, "
+            f"adv_weight={cfg.train.adv_weight}, ramp={cfg.train.adv_weight_ramp_epochs} epoch"
+        )
 
     # ── Loss ───────────────────────────────────────────────────
     loss_fn = ReconstructionLoss(
@@ -258,12 +281,13 @@ def train(
 
     # ── Resume ─────────────────────────────────────────────────
     start_epoch    = 0
-    best_val_score = float("inf")  # identity RAW LOSS - dusuk = iyi (bkz. validate() notu)
+    best_val_score = float("inf")  # identity RAW LOSS - dusuk = iyi
     patience_ctr   = 0
 
     if resume_from and Path(resume_from).exists():
         start_epoch, best_val_score = load_checkpoint(
-            model, optimizer, scheduler, resume_from, device
+            model, optimizer, scheduler, resume_from, device,
+            discriminator=discriminator, disc_optimizer=disc_optimizer,
         )
 
     # ── TensorBoard ────────────────────────────────────────────
@@ -278,31 +302,60 @@ def train(
         epoch_loss  = 0.0
         step_count  = 0
 
+        use_gan_this_epoch = (discriminator is not None) and (epoch >= cfg.train.gan_start_epoch)
+        adv_w = _current_adv_weight(cfg, epoch) if use_gan_this_epoch else 0.0
+
         for step, (embeddings, real_imgs) in enumerate(train_loader):
             embeddings = embeddings.to(device, non_blocking=True)
             real_imgs  = real_imgs.to(device, non_blocking=True)
             if device.type == "cuda":
-                embeddings = embeddings.contiguous(memory_format=torch.channels_last) \
-                    if embeddings.dim() == 4 else embeddings
-                real_imgs  = real_imgs.contiguous(memory_format=torch.channels_last)
+                real_imgs = real_imgs.contiguous(memory_format=torch.channels_last)
 
-            # Transport simulation: INT8 roundtrip (PDF v2.0 §6.3)
             if cfg.train.transport_simulate:
                 embeddings = transport_simulate(embeddings)
 
+            # ---- Generator adimi ----
             optimizer.zero_grad(set_to_none=True)
-
             with autocast("cuda", enabled=cfg.train.use_amp):
                 generated = model(embeddings)
                 losses    = loss_fn(generated, real_imgs, weights)
+                g_total   = losses["total"]
 
-            scaler.scale(losses["total"]).backward()
+                if use_gan_this_epoch and adv_w > 0:
+                    fake_logits = discriminator(generated)
+                    adv_loss_g = F.binary_cross_entropy_with_logits(
+                        fake_logits, torch.ones_like(fake_logits)
+                    )
+                    g_total = g_total + adv_w * adv_loss_g
+                else:
+                    adv_loss_g = torch.zeros((), device=device)
+
+            scaler.scale(g_total).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_loss += losses["total"].item()
+            # ---- Discriminator adimi ----
+            if use_gan_this_epoch:
+                disc_optimizer.zero_grad(set_to_none=True)
+                with autocast("cuda", enabled=cfg.train.use_amp):
+                    real_logits = discriminator(real_imgs)
+                    fake_logits_d = discriminator(generated.detach())
+                    d_loss_real = F.binary_cross_entropy_with_logits(
+                        real_logits, torch.full_like(real_logits, 0.9)  # label smoothing
+                    )
+                    d_loss_fake = F.binary_cross_entropy_with_logits(
+                        fake_logits_d, torch.zeros_like(fake_logits_d)
+                    )
+                    d_loss = 0.5 * (d_loss_real + d_loss_fake)
+                disc_scaler.scale(d_loss).backward()
+                disc_scaler.step(disc_optimizer)
+                disc_scaler.update()
+            else:
+                d_loss = torch.zeros((), device=device)
+
+            epoch_loss += g_total.item()
             step_count += 1
 
             global_step = epoch * len(train_loader) + step
@@ -314,23 +367,30 @@ def train(
                     f"loss={losses['total'].item():.4f}  "
                     f"id={losses['identity'].item():.4f}  "
                     f"perc={losses['perceptual'].item():.4f}  "
+                    f"adv_g={adv_loss_g.item():.4f}  "
+                    f"d_loss={d_loss.item():.4f}  "
                     f"lr={lr:.2e}"
                 )
                 for k, v in losses.items():
                     writer.add_scalar(f"train/{k}", v.item(), global_step)
+                if use_gan_this_epoch:
+                    writer.add_scalar("train/adv_g", adv_loss_g.item(), global_step)
+                    writer.add_scalar("train/d_loss", d_loss.item(), global_step)
+                    writer.add_scalar("train/adv_weight", adv_w, global_step)
                 writer.add_scalar("train/lr", lr, global_step)
 
         scheduler.step()
 
         # ── Validation ─────────────────────────────────────────
         val_losses = validate(model, loss_fn, val_loader, device, weights, writer, epoch)
-        val_id_score = val_losses["identity_score"]  # RAW loss, dusuk = iyi
+        val_id_score = val_losses["identity_score"]
 
         log.info(
             f"[Val] epoch={epoch+1}  "
             f"total={val_losses['total']:.4f}  "
             f"identity_score(raw_loss, dusuk_iyi)={val_id_score:.4f}  "
-            f"best={best_val_score:.4f}"
+            f"best={best_val_score:.4f}  "
+            f"gan_aktif={use_gan_this_epoch}"
         )
 
         # ── Bağımsız Evaluator (PDF v2.0 §7) ───────────────────
@@ -352,7 +412,6 @@ def train(
             model.train()
 
         # ── Checkpoint ─────────────────────────────────────────
-        # RAW identity LOSS kullanildigi icin kriter tersine dondu: dusuk = iyi.
         is_best = val_id_score < best_val_score - cfg.train.min_delta
         if is_best:
             best_val_score = val_id_score
@@ -368,11 +427,9 @@ def train(
                     "optimizer":      optimizer.state_dict(),
                     "scheduler":      scheduler.state_dict(),
                     "best_val_score": best_val_score,
-                    # cfg dataclass'i ham haliyle pickle edilirse, modul
-                    # yeniden yuklendiginde (git clone tekrar calisinca)
-                    # sinif kimligi degisip PicklingError verir. dict'e
-                    # cevirerek bu riski tamamen ortadan kaldiriyoruz.
-                    "config": asdict(cfg) if is_dataclass(cfg) else cfg,
+                    "config":         asdict(cfg) if is_dataclass(cfg) else cfg,
+                    "discriminator":  discriminator.state_dict() if discriminator is not None else None,
+                    "disc_optimizer": disc_optimizer.state_dict() if disc_optimizer is not None else None,
                 },
                 save_dir=cfg.train.save_dir,
                 epoch=epoch + 1,
@@ -388,7 +445,7 @@ def train(
             )
             break
 
-    # ── Nihai Test Değerlendirmesi (tek seferlik, hiç görülmemiş kimlikler) ──
+    # ── Nihai Test Değerlendirmesi ──
     best_ckpt = Path(cfg.train.save_dir) / "best_model.pt"
     if best_ckpt.exists():
         state = torch.load(best_ckpt, map_location=device)
@@ -418,7 +475,6 @@ def train(
     writer.close()
     log.info(f"Eğitim tamamlandı. En iyi val identity score (raw loss): {best_val_score:.4f}")
 
-    # Best model yolunu döndür
     return str(best_ckpt)
 
 
