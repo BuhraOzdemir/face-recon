@@ -28,8 +28,10 @@ def subsample_manifest(src_manifest_path, dst_manifest_path, max_per_identity=5,
     print(f'Alt-orneklenmis: {len(subsampled_lines):,} ornek, {len(by_identity):,} kimlik (ayni)')
     return dst_manifest_path
 
-manifest_path = subsample_manifest(
-    src_manifest_path=manifest_path,
-    dst_manifest_path='/kaggle/working/manifest_200k.txt',
-    max_per_identity=5,
-)
+def train(cfg, manifest_path, resume_from=None):
+    manifest_path = subsample_manifest(
+        src_manifest_path=manifest_path,
+        dst_manifest_path='/kaggle/working/manifest_200k.txt',
+        max_per_identity=5,
+    )
+    # ... fonksiyonun geri kalan kodu (varsa) buradan devam eder
