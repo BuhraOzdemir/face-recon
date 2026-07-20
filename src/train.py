@@ -138,6 +138,16 @@ def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
 
 # ─── Validation ───────────────────────────────────────────────────────────────
 
+def _compute_psnr(generated: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
+    """generated, real: [-1,1] araliginda. PSNR dB cinsinden dondurur (yuksek=iyi)."""
+    gen_01  = generated * 0.5 + 0.5
+    real_01 = real * 0.5 + 0.5
+    mse = torch.mean((gen_01 - real_01) ** 2, dim=[1, 2, 3])
+    mse = mse.clamp(min=1e-10)  # log(0) onlemi
+    psnr = 10 * torch.log10(1.0 / mse)
+    return psnr.mean()
+
+
 @torch.no_grad()
 def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
     """
@@ -146,10 +156,14 @@ def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
     hesaplaniyor. Aksi halde faz1'de weights['identity']=0 oldugu icin
     identity loss hep 0 cikar ve en iyi model secimi faz1 sonunda
     kalici olarak kilitlenir.
+
+    psnr_db ve ssim_raw SADECE raporlama icindir; toplam loss'a
+    (backward'a) hicbir etkisi yoktur.
     """
     model.eval()
     total_losses: Dict[str, float] = {}
     identity_raw_sum = 0.0
+    psnr_sum = 0.0
     n_batches = 0
 
     eval_weights = dict(weights)
@@ -168,10 +182,14 @@ def validate(model, loss_fn, val_loader, device, weights, writer, epoch):
         for k, v in losses.items():
             total_losses[k] = total_losses.get(k, 0.0) + v.item()
         identity_raw_sum += eval_losses["identity"].item()
+        psnr_sum += _compute_psnr(generated, real_imgs).item()
         n_batches += 1
 
     avg = {k: v / n_batches for k, v in total_losses.items()}
     avg["identity_score"] = identity_raw_sum / n_batches
+    avg["psnr_db"] = psnr_sum / n_batches
+    # ssim loss'u zaten "1 - SSIM" olarak tutuluyor; ham SSIM'i buradan turetiyoruz
+    avg["ssim_raw"] = 1.0 - avg["ssim"]
 
     if writer:
         for k, v in avg.items():
@@ -389,6 +407,8 @@ def train(
             f"[Val] epoch={epoch+1}  "
             f"total={val_losses['total']:.4f}  "
             f"identity_score(raw_loss, dusuk_iyi)={val_id_score:.4f}  "
+            f"PSNR={val_losses['psnr_db']:.2f}dB  "
+            f"SSIM={val_losses['ssim_raw']:.4f}  "
             f"best={best_val_score:.4f}  "
             f"gan_aktif={use_gan_this_epoch}"
         )
