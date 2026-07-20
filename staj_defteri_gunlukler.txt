@@ -1,0 +1,120 @@
+================================================================================
+STAJ DEFTERİ — GÜNLÜK ANLATIMLAR (HER GÜN ≈ 1 SAYFA)
+Proje: Mobil çevrimdışı yüz rekonstrüksiyon sistemi
+Dönem: 14 Temmuz 2026 – 20 Temmuz 2026
+
+Word ayarı: Times New Roman / Liberation Serif · 12 punto · 1,5 satır aralığı
+Hizalama: İki yana yaslı · Noktalamadan sonra 1 boşluk · Edilgen anlatım
+Her başlığı ayrı sayfaya yapıştırınız.
+================================================================================
+
+
+
+==================== SAYFA 1 ====================
+14 Temmuz 2026 – Salı
+=================================================
+
+Staj kapsamında mobil cihazlarda internet bağlantısı olmadan çalışabilecek bir yüz rekonstrüksiyon sistemi üzerinde çalışmaya başlanmıştır. Projenin amacı, yüz tanıma modellerinden elde edilen gömme vektörünün (embedding) kullanılarak kişinin yüz görüntüsünün yeniden üretilmesi ve üretilen modelin mobil ortama aktarılabilir boyutta tutulmasıdır. Hedef çıktı çözünürlüğü 128×128 olarak belirlenmiş; modelin TensorFlow Lite (TFLite) biçiminde dışa aktarılabilmesi planlanmıştır.
+
+Gün içinde önce proje iskeleti oluşturulmuştur. Yapılandırma, eğitim döngüsü, veri ön işleme, kod çözücü (decoder), kayıp fonksiyonları ve TFLite dışa aktarım betikleri hazırlanmıştır. Kod çözücü mimarisinde derinlik ayrılabilir evrişim (depthwise separable convolution) blokları kullanılmış; böylece parametre sayısı düşük tutulmaya çalışılmıştır. Modelin yaklaşık 1,15 milyon parametreye sahip olduğu, float32 ile yaklaşık 4,4 MB ve INT8 niceleme sonrası yaklaşık 1,1 MB boyutuna inebileceği hesaplanmıştır. Mobil dağıtım için bu boyutların uygun olduğu değerlendirilmiştir.
+
+Kayıp tarafında L1, algısal (perceptual), kimlik (identity) ve yapısal benzerlik (SSIM) bileşenlerinin birlikte kullanılmasına karar verilmiştir. Algısal kayıp için VGG16 ara katman özelliklerinden; kimlik kaybı için ise IResNet50-ArcFace tabanlı denetleyiciden yararlanılması öngörülmüştür. Bu sayede yalnızca piksel benzerliği değil, yüz kimliğinin korunması da eğitim hedefine dahil edilmiştir.
+
+Eğitim ortamı olarak Kaggle seçilmiştir. MS1MV3 veri setinin RecordIO biçiminde bulunduğu görülmüş ve çıkarma (extraction) işlemleri geliştirilmiştir. Etiketlerin IRHeader yapısından doğru okunması için ofset düzeltilmiş; disk kotası nedeniyle kimlik başına örnek sayısı ve JPEG kalitesi düşürülerek yaklaşık 93 bin kimliğin kotaya sığması sağlanmıştır. ArcFace ağırlık indirmede 403 hatası alınmış, User-Agent eklenerek giderilmiştir. onnxruntime ile onnxruntime-gpu çakışması yaşanmış; PyTorch ABI bozulması riski nedeniyle güvenli tarafta CPU onnxruntime ile devam edilmiştir. Gün sonunda iskelet, veri çıkarma ve eğitim not defteri temel düzeyde çalışır hale getirilmiştir. Edinilen bilgi, büyük ölçekli yüz verisi ile mobil model kısıtlarının birlikte tasarlanması gerektiğidir.
+
+
+
+==================== SAYFA 2 ====================
+15 Temmuz 2026 – Çarşamba
+=================================================
+
+Bir önceki günde başlatılan mobil yüz rekonstrüksiyon çalışmasına ortam kararlılığı ve eğitim öncesi hazırlık odaklı olarak devam edilmiştir. Özellikle Kaggle oturumlarında paket sürümlerinin birbirini ezmesi, CUDA çalışma zamanı kütüphanelerinin eksik kalması ve PyTorch ile ONNX Runtime arasındaki ABI uyumsuzluğu konuları incelenmiştir. Bu tür hataların eğitim kodundan bağımsız olarak tüm deneyi bozabildiği görülmüş; önce ortamın sabitlenmesi gerektiği sonucuna varılmıştır.
+
+Gün içinde GPU destekli eğitim için gereken bağımlılıkların sürüm uyumu araştırılmıştır. onnxruntime-gpu sürümlerinin hangi PyTorch ve CUDA kombinasyonlarıyla sorunsuz çalıştığına dair notlar alınmıştır. Ayrıca büyük yüz veri setlerinde disk kotası, inode limiti ve dosya sistemi gecikmesi gibi altyapı kısıtlarının, model mimarisinden bağımsız olarak eğitim süresini belirlediği gözlemlenmiştir. MS1MV3 gibi yüz binlerce kimlik içeren veri setlerinde her görüntünün ayrı dosya olarak tutulmasının inode tüketimini hızla artırdığı anlaşılmış; ilerleyen günlerde tar shard (parçalı tar arşivi) yaklaşımına geçilmesi planlanmıştır.
+
+Teorik olarak encoder–decoder ayrımı yeniden gözden geçirilmiştir. Mobil tarafta kullanılacak gömme vektörünün MobileFaceNet benzeri hafif bir ağa ait olması; eğitimdeki kimlik denetiminin ise daha güçlü ArcFace modeliyle yapılması gerektiği değerlendirilmiştir. Mobil model küçük ve hızlı olmalı; denetleyici model ise kimlik benzerliğini daha doğru ölçmelidir. Ayrıca eğitim fazlarının neden aşamalı tasarlandığı incelenmiştir. İlk fazda L1 ve algısal kayıplarla kaba yapı öğrenilirken, sonraki fazlarda kimlik kaybı ağırlığının artırılması öngörülmüştür. Bu yaklaşımın erken dönem kararsızlığını azaltabileceği düşünülmüştür.
+
+Gün sonunda ortam sorunlarının kaynağı netleştirilmiş; bir sonraki iş gününde GPU paketlerinin sabit sürümle kurulması ve kimlik bazlı veri ayrımının uygulanması için yol haritası oluşturulmuştur. Edinilen bilgi, derin öğrenme projelerinde kod kadar bağımlılık ve depolama yönetiminin de kritik olduğudur. Ayrıca bulut eğitim platformlarında yerel bilgisayarda görülmeyen kısıtların (kota, inode, oturum süresi) planlamayı doğrudan etkilediği gözlemlenmiştir.
+
+
+
+==================== SAYFA 3 ====================
+16 Temmuz 2026 – Perşembe
+=================================================
+
+Kaggle eğitim ortamının kararlı hale getirilmesi amacıyla onnxruntime-gpu sürümü 1.19.2 olarak sabitlenmiştir. Protobuf bağımlılığı da uyumlu sürüme kilitlenmiş; çakışan paketlerin eğitimi yarıda kesmesi engellenmeye çalışılmıştır. Bu düzenleme sonrasında ortamın daha öngörülebilir çalıştığı görülmüştür. ArcFace ağırlık indirmesinde geçici ağ hatalarına (504 vb.) karşı geri deneme (retry) ve artan bekleme (backoff) mekanizması eklenmiştir. Böylece kısa süreli ağ kesintilerinde tüm oturumun baştan başlaması önlenmiştir.
+
+Veri ayrımı konusunda önemli bir iyileştirme yapılmıştır. Rastgele görüntü bazlı ayırım yerine kimlik bazlı eğitim, doğrulama ve test ayrımı uygulanmıştır. Amacı, değerlendirme sızıntısını (data leakage) önlemektir. Aynı kişinin farklı görüntüleri hem eğitim hem test kümesine düştüğünde model ezber yoluyla yüksek skor üretebilmekte ve gerçek genelleme abartılı görülmektedir. Kimlik bazlı ayrım ile bu risk azaltılmıştır.
+
+Eğitimden önce mimarinin öğrenebildiğini doğrulamak için 32 örnekli aşırı öğrenme (overfit) kontrolü eklenmiştir. Bu testte modelin çok küçük bir alt kümede kaybı düşürüp düşüremediği izlenmiştir. İlk eşik mantığında yanlış alarm üretildiği tespit edilmiş; eşikler düzeltilerek kontrol anlamlı hale getirilmiştir. Küçük sette öğrenmenin mümkün olduğu doğrulandıktan sonra asıl eğitime geçilmesine karar verilmiştir. Kaggle oturum süreleri sınırlı olduğu için toplam eğitim 20 epoch’a indirilmiş; fazlar 3+10+7 şeklinde planlanmıştır. Böylece hem kaba yapı hem kimlik odaklı ince ayar için zaman ayrılmıştır.
+
+Depolama tarafında MS1MV3 çıkarma ve ön işlemede inode limiti nedeniyle tar shard yaklaşımı uygulanmıştır. Görüntülerin ve gömme vektörlerinin parçalı arşivler halinde tutulmasıyla dosya sayısı azaltılmış; disk ve inode baskısı düşürülmüştür. Ön işlemede yüz hizalama adımları da gözden geçirilmiş; InsightFace nesne yapısında doğrudan özellik kontrolünün güvenilir olmadığı durumlarda manuel hizalama yoluna gidilmiştir. Gün sonunda veri boru hattı, kimlik bazlı ayrım ve eğitim öncesi doğrulama adımları tamamlanmıştır. Edinilen bilgi, model eğitiminde verinin nasıl bölündüğünün kullanılan mimari kadar belirleyici olduğudur.
+
+
+
+==================== SAYFA 4 ====================
+17 Temmuz 2026 – Cuma
+=================================================
+
+Eğitim betiği üzerinde hem hız hem doğruluk odaklı iyileştirmeler yapılmıştır. Sabit girdi boyutlarında cuDNN’in en hızlı algoritmayı seçip önbelleklemesi için benchmark ayarı açılmıştır. TF32 matmul ve evrişim desteği etkinleştirilerek GPU veriminin artırılması hedeflenmiştir. Model channels_last bellek düzenine alınmış; evrişim ağırlıklı hesaplarda Tensor Core kullanımının yükseltilmesi amaçlanmıştır. Karışık kesinlik (automatic mixed precision, AMP) kullanımı güncel torch.amp arayüzüne taşınmıştır. Bu değişikliklerin T4 sınıfı GPU’larda eğitim adımı süresini kısaltması beklenmiştir.
+
+Doğrulama aşamasında kritik bir mantık hatası giderilmiştir. Birinci eğitim fazında kimlik kaybı ağırlığı sıfır olduğu için “en iyi model” skorunun faz 1 sonunda kilitlendiği tespit edilmiştir. Bu durumda sonraki fazlarda kimlik başarımı artsa bile checkpoint seçiminin güncellenemediği anlaşılmıştır. Sorunu çözmek için checkpoint kararında kullanılan kimlik skoru, eğitim fazı ağırlıklarından bağımsız sabit bir ağırlıkla ayrıca hesaplanacak şekilde düzenlenmiştir. En iyi model ölçütü, kimlik ham kaybının düşük olması esasına göre güncellenmiştir. Bu düzeltme, aşamalı kayıp planının doğru çalışması için zorunlu görülmüştür.
+
+Veri çıkarma ve ön işleme modüllerinde ek düzeltmeler uygulanmış; eğitim oturumu Kaggle üzerinde başlatılmıştır. Doğrulama logları izlendiğinde kimlik skorunun epoch ilerledikçe düştüğü (iyileştiği) gözlemlenmiştir. İleri epoch’larda identity_score değerinin yaklaşık 0,30 bandından 0,24–0,25 bandına gerilediği kaydedilmiştir. Toplam doğrulama kaybında da azalma eğilimi görülmüştür. Bu sonuç, modelin yalnızca görüntü benzerliğini değil kimlik bilgisini de koruma yönünde ilerlediğini göstermiştir.
+
+Gün içinde uzun süren epoch’ların kaynak tüketimi izlenmiştir. Büyük veri setinde her epoch’un saatler düzeyinde sürebildiği; bu nedenle checkpoint kaydı, erken durdurma ve en iyi model kopyasının düzenli tutulmasının önemli olduğu görülmüştür. Edinilen bilgi, eğitim metriklerinin faz ağırlıklarından bağımsız tanımlanması gerektiği ve aksi halde en iyi model seçiminin yanıltıcı olabileceğidir. GPU hızlandırma ayarlarının doğru uygulandığında ek kod karmaşıklığı yaratmadan süre kazancı sağlayabildiği de gözlemlenmiştir.
+
+
+
+==================== SAYFA 5 ====================
+18 Temmuz 2026 – Cumartesi
+=================================================
+
+Veri yükleme aşamasında ciddi bir performans darboğazı incelenmiştir. Eğitim başlamadan önce manifest dosyasındaki yüz binlerce satır için görüntü ve gömme dosyalarının varlığı kontrol edilmektedir. Bu kontrolün tek iş parçacığında yürütülmesi, Kaggle’ın FUSE tabanlı salt okunur depolama katmanında dosya başına birkaç milisaniyelik gecikmelerin birikmesine yol açmıştır. Sonuç olarak yalnızca varlık kontrolünün onlarca dakikaya uzadığı görülmüştür. Bu gecikme, model eğitiminin kendisinden bağımsız olarak oturum süresini boşa harcamaktaydı.
+
+Sorunun giderilmesi için varlık kontrolleri ThreadPoolExecutor ile paralelleştirilmiştir. I/O beklemelerinin eşzamanlı yürütülmesi sayesinde kontrol süresinin belirgin biçimde kısalması sağlanmıştır. Bu düzenleme, merkezi işlem birimi hesap yükünden çok depolama gecikmesine bağlı bir hızlanma örneği olarak değerlendirilmiştir. Python’da Global Interpreter Lock (GIL) bulunmasına rağmen, I/O beklemelerinde iş parçacığı yaklaşımının pratikte fayda verdiği gözlemlenmiştir.
+
+Aynı gün eğitim logları üzerinden ilerleme izlenmeye devam edilmiştir. Doğrulama kayıplarının ve kimlik skorunun epoch’lar boyunca iyileşme eğiliminde olduğu teyit edilmiştir. Uzun süren eğitim oturumlarında (on binlerce saniye düzeyinde epoch süreleri) kaynak kullanımının sınırlı olduğu; bu nedenle veri yükleme, ön işleme ve checkpoint yönetimindeki küçük iyileştirmelerin toplam sürede büyük fark yarattığı anlaşılmıştır. Ayrıca bozuk veya eksik dosya yollarının eğitim sırasında geç ortaya çıkmaması için manifest doğrulamasının eğitim öncesinde yapılması gerektiği bir kez daha görülmüştür.
+
+Teorik açıdan, büyük ölçekli derin öğrenme iş yüklerinde hesaplama süresi ile veri bekleme süresinin ayrıştırılması gerektiği değerlendirilmiştir. GPU meşgulken veri boru hattı yetersiz kalırsa hızlandırıcı boşta bekler; veri hazırlığı yavaşsa oturumun büyük kısmı eğitim dışı işlemlerde harcanır. Gün sonunda paralel I/O düzenlemesi tamamlanmış ve eğitim hazırlık süresi kısaltılmıştır. Edinilen bilgi, bulut platformlarında dosya sistemi davranışının yerel diskten çok farklı olabileceği ve buna göre yazılım tasarımı yapılması gerektiğidir.
+
+
+
+==================== SAYFA 6 ====================
+19 Temmuz 2026 – Pazar
+=================================================
+
+Staj sürecinde bir önceki günlerde başlatılan uzun soluklu eğitim oturumunun sonuçları izlenmiş ve kayıt altına alınmıştır. Kaggle üzerinde devam eden yüz rekonstrüksiyon eğitiminde doğrulama metrikleri düzenli aralıklarla kontrol edilmiştir. Kimlik skorunun epoch ilerledikçe düşme eğilimini koruyup korumadığı, toplam kaybın kararlı azalıp azalmadığı ve en iyi model checkpoint’inin güncellenip güncellenmediği gözlemlenmiştir. Uzun süren eğitimlerde ara ara kontrol yapılmazsa oturumun sessizce hata ile durduğu veya diskin dolduğu durumların geç fark edilebileceği görülmüştür.
+
+Gün içinde elde edilen log örnekleri incelenmiştir. Doğrulama satırlarında epoch numarası, toplam kayıp ve identity_score değerleri birlikte değerlendirilmiştir. Özellikle kimlik skorunun yaklaşık 0,30 bandından daha düşük değerlere inmesi, modelin kimlik bilgisini koruma yönünde ilerlediğinin göstergesi olarak yorumlanmıştır. Aynı zamanda epoch sürelerinin saatler düzeyinde olması nedeniyle, bir sonraki iş gününde yapılacak iyileştirmelerin eğitim hızına odaklanması gerektiği not edilmiştir.
+
+Teorik olarak aşamalı kayıp planının pratikteki etkisi değerlendirilmiştir. İlk fazlarda yapı ve doku öğrenilirken, ilerleyen fazlarda kimlik ağırlığının artmasıyla yüz benzerliğinin güçlenmesi beklenmektedir. Bu beklentinin loglarla kısmen örtüştüğü; ancak görsel gerçekçilik için ek yöntemlere ihtiyaç duyulabileceği düşünülmüştür. Bu nedenle sonraki günde üretici çekişmeli ağ (GAN) yaklaşımının denenmesi planlanmıştır.
+
+Ayrıca mobil dağıtım hedefi hatırlatılarak, eğitimde kullanılan yardımcı modellerin (ArcFace, ayırt edici vb.) çıkarım grafiğine karışmaması gerektiği tekrar gözden geçirilmiştir. Gün sonunda eğitim izleme notları tamamlanmış; Pazartesi günü için PatchGAN entegrasyonu ve checkpoint yönetiminin genişletilmesi kararlaştırılmıştır. Edinilen bilgi, uzun eğitimlerde yalnızca kod yazmanın değil, metrik takibi ve kayıt disiplininin de staj çalışmasının önemli bir parçası olduğudur.
+
+
+
+==================== SAYFA 7 ====================
+20 Temmuz 2026 – Pazartesi
+=================================================
+
+Üretilen yüz görüntülerinin görsel gerçekçiliğini artırmak amacıyla üretici çekişmeli ağ (Generative Adversarial Network, GAN) yaklaşımı eğitim sürecine eklenmiştir. Bu kapsamda PatchGAN tabanlı bir ayırt edici (discriminator) modülü yazılmıştır. Ayırt edicinin görevi, gerçek yüz görüntüleri ile kod çözücünün ürettiği görüntüleri yerel yamalar (patch) düzeyinde ayırt etmeye çalışmaktır. Kod çözücü ise ayırt ediciyi yanıltacak daha gerçekçi çıktılar üretmeye zorlanır. Bu çekişmeli öğrenmenin, yalnızca L1 veya algısal kayıpla ortaya çıkabilen bulanık/ortalama görüntü etkisini azaltabileceği değerlendirilmiştir.
+
+Ayırt edici mimarisinde spektral normalizasyon kullanılmıştır. Amacı, eğitim sırasında gradyan patlaması ve mod çökmesi gibi kararsızlıkları azaltmaktır. Ayırt edicinin 128×128 girdiden kademeli olarak daha küçük uzamsal çözünürlüğe inerek yama düzeyinde logit haritası üretmesi sağlanmıştır. Önemli bir tasarım kararı olarak ayırt edicinin yalnızca eğitim aşamasında kullanılacağı; mobil cihaza aktarılacak FaceDecoder modeline dahil edilmeyeceği açıkça ayrılmıştır. Böylece model boyutu kısıtı etkilenmeden gerçekçilik artırımının denenmesi hedeflenmiştir.
+
+Eğitim döngüsü, ayırt edici ağırlıklarının ve ilgili eniyileyici (optimizer) durumunun checkpoint dosyasına kaydedilip geri yüklenebileceği şekilde güncellenmiştir. Önceden yalnızca üretici model kaydedilirken, artık kesintiye uğrayan bir GAN eğitiminin kaldığı yerden devam edebilmesi sağlanmıştır. Yapılandırma dosyasında GAN ile ilgili hiperparametreler tanımlanmış; kayıp bileşenlerinin hangi fazda devreye gireceği gözden geçirilmiştir. Gün içinde eğitim betiği üzerinde ek düzenlemeler sürdürülmüş ve çekişmeli eğitimin mevcut L1, algısal, kimlik ve SSIM kayıplarıyla birlikte nasıl dengeleneceği değerlendirilmiştir.
+
+Gözlemlenen temel risk, ayırt edici kaybının kimlik kaybını bastırması veya üreticinin bozulmasıdır. Bu nedenle GAN bileşeninin kontrollü ağırlıkla ve tercihen ileri fazlarda devreye alınması gerektiği sonucuna varılmıştır. Mobil dağıtım hedefi korunarak, eğitimde kullanılan yardımcı ağların çıkarım grafiğine karışmamasına özen gösterilmiştir. Gün sonunda PatchGAN entegrasyonu tamamlanmış ve staj sürecindeki yazılım geliştirme çalışmaları bu tarihte de devam etmiştir. Edinilen bilgi, gerçekçilik için GAN’ın faydalı olabileceği; ancak mobil ürün kısıtlarında eğitim bileşenleri ile dağıtım bileşenlerinin net ayrılması gerektiğidir.
+
+
+
+================================================================================
+KISALTMALAR (Ekler)
+================================================================================
+AMP    : Automatic Mixed Precision (otomatik karışık kesinlik)
+GAN    : Generative Adversarial Network (üretici çekişmeli ağ)
+GIL    : Global Interpreter Lock
+MS1MV3 : MS1M Version 3 yüz veri seti
+SSIM   : Structural Similarity Index Measure
+TFLite : TensorFlow Lite
+================================================================================

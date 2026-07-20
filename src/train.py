@@ -62,17 +62,23 @@ def save_checkpoint(
 def load_checkpoint(
     model: nn.Module,
     optimizer,
-    scheduler,
     ckpt_path: str,
     device: torch.device,
     discriminator: Optional[nn.Module] = None,
     disc_optimizer=None,
 ):
+    """
+    NOT: scheduler KASITLI olarak yuklenmiyor. Checkpoint'teki scheduler
+    state'i farkli bir cfg.train.epochs (farkli T_max) ile hesaplanmis
+    olabilir; bunu yeni bir scheduler'a yuklemek LR'nin beklenmedik
+    sekilde artmasina/tutarsiz olmasina yol aciyordu (epoch 26->27
+    arasi lr 1.87e-05 -> 2.58e-05 artisi gibi). Bunun yerine train()
+    icinde scheduler, start_epoch kadar .step() ile "ileri sarilarak"
+    her zaman GUNCEL cfg.train.epochs'a gore dogru konuma getiriliyor.
+    """
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
-    if scheduler and "scheduler" in state:
-        scheduler.load_state_dict(state["scheduler"])
 
     if discriminator is not None:
         if state.get("discriminator") is not None:
@@ -304,9 +310,18 @@ def train(
 
     if resume_from and Path(resume_from).exists():
         start_epoch, best_val_score = load_checkpoint(
-            model, optimizer, scheduler, resume_from, device,
+            model, optimizer, resume_from, device,
             discriminator=discriminator, disc_optimizer=disc_optimizer,
         )
+        # Scheduler'i checkpoint'ten YUKLEMEK yerine, guncel cfg.train.epochs'a
+        # gore taze kurulan scheduler'i start_epoch kadar ileri sar. Bu, farkli
+        # epoch sayilariyla resume edildiginde LR'nin tutarli/monoton azalmasini
+        # garanti eder (onceki bug: farkli T_max'li eski state yuklenince LR
+        # epoch 26->27 arasi 1.87e-05 -> 2.58e-05 gibi beklenmedik artiyordu).
+        for _ in range(start_epoch):
+            scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        log.info(f"[Scheduler] {start_epoch} epoch ileri sarildi, guncel lr={current_lr:.2e}")
 
     # ── TensorBoard ────────────────────────────────────────────
     writer = SummaryWriter(log_dir=cfg.train.log_dir)
