@@ -66,8 +66,8 @@ class TrainConfig:
     save_every_epochs: int = 5
     keep_last_n: int = 3
 
-    patience: int = 10
-    min_delta: float = 1e-4
+    patience: int = 20 
+    min_delta: float = 1e-5 
 
     use_amp: bool = True
     transport_simulate: bool = True
@@ -84,7 +84,7 @@ class TrainConfig:
     use_gan: bool = True
     gan_start_epoch: int = 5        # identity/perceptual biraz oturduktan sonra GAN devreye girsin
     disc_lr: float = 1e-4
-    adv_weight: float = 0.05        # generator loss'una eklenen adversarial ağırlık (tavan değer)
+    adv_weight: float = 0.4         # generator loss'una eklenen adversarial ağırlık (tavan değer)
     adv_weight_ramp_epochs: int = 3 # 0'dan adv_weight'e bu kadar epoch'ta lineer yükselt
 
 
