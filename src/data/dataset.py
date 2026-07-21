@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -117,6 +118,42 @@ def _load_manifest_samples(manifest_path: str) -> List[Tuple[str, str, str]]:
     return samples
 
 
+def _cap_samples_by_identity(
+    samples: List[Tuple[str, str, str]],
+    max_samples: Optional[int],
+    seed: int = 42,
+) -> List[Tuple[str, str, str]]:
+    """
+    Toplam örnek sayısını max_samples ile sınırlar.
+    Kimlikleri karıştırıp kimlik kimlik ekler; son kimlikte gerekirse kırpılır.
+    """
+    if max_samples is None or max_samples <= 0 or len(samples) <= max_samples:
+        return samples
+
+    by_id: dict = defaultdict(list)
+    for s in samples:
+        by_id[s[2]].append(s)
+
+    rng = random.Random(seed)
+    identities = list(by_id.keys())
+    rng.shuffle(identities)
+
+    selected: List[Tuple[str, str, str]] = []
+    for iid in identities:
+        imgs = by_id[iid]
+        rng.shuffle(imgs)
+        remaining = max_samples - len(selected)
+        if remaining <= 0:
+            break
+        selected.extend(imgs[:remaining])
+
+    log.info(
+        f"max_samples={max_samples:,}: {len(samples):,} → {len(selected):,} örnek "
+        f"({len(set(s[2] for s in selected)):,} kimlik)"
+    )
+    return selected
+
+
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
 class FaceDataset(Dataset):
@@ -173,14 +210,18 @@ def build_dataloaders(
     test_split: float = 0.05,
     num_workers: int = 4,
     seed: int = 42,
+    max_samples: int = 100_000,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Train / Validation / Test DataLoader'larını KİMLİK BAZLI olarak oluşturur.
 
     Split örnek bazlı DEĞİL, kimlik bazlıdır — bir kimliğin tüm görüntüleri
     yalnızca TEK bir split'te bulunur.
+
+    max_samples: toplam (train+val+test) üst sınırı; aşılırsa kimlik bazlı kırpılır.
     """
     all_samples = _load_manifest_samples(manifest_path)
+    all_samples = _cap_samples_by_identity(all_samples, max_samples, seed=seed)
 
     identities = sorted(set(s[2] for s in all_samples))
     rng = random.Random(seed)
@@ -209,7 +250,8 @@ def build_dataloaders(
         f"Kimlik bazlı split — "
         f"train: {len(train_ids):,} kimlik / {len(train_samples):,} görüntü | "
         f"val: {len(val_ids):,} kimlik / {len(val_samples):,} görüntü | "
-        f"test: {len(test_ids):,} kimlik / {len(test_samples):,} görüntü"
+        f"test: {len(test_ids):,} kimlik / {len(test_samples):,} görüntü | "
+        f"toplam: {len(all_samples):,} (max_samples={max_samples})"
     )
 
     train_ds = FaceDataset(train_samples, build_train_transform(image_size), image_size)

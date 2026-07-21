@@ -4,6 +4,7 @@ Ana eğitim döngüsü.
 Colab'da doğrudan import edilebilir veya bağımsız çalıştırılabilir.
 """
 
+import copy
 import os
 import logging
 import shutil
@@ -128,6 +129,147 @@ def _current_adv_weight(cfg: Config, epoch: int) -> float:
     return cfg.train.adv_weight * progress
 
 
+def _feature_matching_loss(fake_feats, real_feats) -> torch.Tensor:
+    """PatchGAN ara katman L1 farkı (generator keskinlik sinyali)."""
+    loss = fake_feats[0].new_zeros(())
+    for f_fake, f_real in zip(fake_feats, real_feats):
+        loss = loss + F.l1_loss(f_fake, f_real.detach())
+    return loss / max(len(fake_feats), 1)
+
+
+def _adv_loss_generator(fake_logits: torch.Tensor, gan_loss_type: str) -> torch.Tensor:
+    """
+    Generator adversarial loss. gan_loss_type: "bce" | "lsgan" | "hinge".
+
+    "bce" (vanilla GAN) D cok emin oldugunda gradyan sifira yakinsayabilir
+    (=> zayif keskinlik sinyali). "lsgan" ve "hinge" bu acidan daha stabildir
+    ve genelde daha keskin sonuclara yol acar.
+    """
+    if gan_loss_type == "bce":
+        return F.binary_cross_entropy_with_logits(
+            fake_logits, torch.ones_like(fake_logits)
+        )
+    elif gan_loss_type == "lsgan":
+        return F.mse_loss(fake_logits, torch.ones_like(fake_logits))
+    elif gan_loss_type == "hinge":
+        return -fake_logits.mean()
+    raise ValueError(f"Bilinmeyen gan_loss_type: {gan_loss_type}")
+
+
+def _adv_loss_discriminator(
+    real_logits: torch.Tensor, fake_logits: torch.Tensor, gan_loss_type: str
+) -> torch.Tensor:
+    """Discriminator adversarial loss. Real icin 0.9 label smoothing (bce/lsgan)."""
+    if gan_loss_type == "bce":
+        d_real = F.binary_cross_entropy_with_logits(
+            real_logits, torch.full_like(real_logits, 0.9)
+        )
+        d_fake = F.binary_cross_entropy_with_logits(
+            fake_logits, torch.zeros_like(fake_logits)
+        )
+        return 0.5 * (d_real + d_fake)
+    elif gan_loss_type == "lsgan":
+        d_real = F.mse_loss(real_logits, torch.full_like(real_logits, 0.9))
+        d_fake = F.mse_loss(fake_logits, torch.zeros_like(fake_logits))
+        return 0.5 * (d_real + d_fake)
+    elif gan_loss_type == "hinge":
+        d_real = F.relu(1.0 - real_logits).mean()
+        d_fake = F.relu(1.0 + fake_logits).mean()
+        return 0.5 * (d_real + d_fake)
+    raise ValueError(f"Bilinmeyen gan_loss_type: {gan_loss_type}")
+
+
+def _augment_weights(cfg: Config, base_weights: dict) -> dict:
+    """
+    Opsiyonel loss terimlerinin (lpips, cycle_identity) agirliklarini
+    faz-bazli agirlik sozlugune enjekte eder. Ikisi de kapaliyken
+    (varsayilan) sozluk degismeden doner.
+    """
+    weights = dict(base_weights)
+    if cfg.loss.use_lpips:
+        weights.setdefault("lpips", cfg.loss.lpips_weight)
+    if cfg.loss.cycle_identity_weight > 0:
+        weights.setdefault("cycle_identity", cfg.loss.cycle_identity_weight)
+    return weights
+
+
+def _r1_penalty(discriminator: nn.Module, real_imgs: torch.Tensor) -> torch.Tensor:
+    """
+    StyleGAN2 R1 gradient penalty: D(real)'in gercek piksellere gore
+    gradyaninin L2 normunun karesi. Discriminator'i gercek goruntuler
+    etrafinda asiri keskin/emin karar sinirlari olusturmaktan alikoyar;
+    bu da G'ye daha anlamli/surekli bir gradyan (=> keskinlik sinyali)
+    saglar. Sayisal kararlilik icin autocast/AMP DISINDA (tam hassasiyet)
+    cagrilmalidir — cift backward (create_graph=True) AMP ile guvenilir
+    calismaz.
+    """
+    real_imgs = real_imgs.detach().requires_grad_(True)
+    real_logits = discriminator(real_imgs)
+    grad_real, = torch.autograd.grad(
+        outputs=real_logits.sum(), inputs=real_imgs, create_graph=True,
+    )
+    return grad_real.pow(2).reshape(grad_real.size(0), -1).sum(1).mean()
+
+
+def _diversity_loss(
+    generated_a: torch.Tensor, generated_b: torch.Tensor,
+    noise_a: torch.Tensor, noise_b: torch.Tensor,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    MSGAN-tarzi mode-seeking regularization:
+        loss = -lambda * ||G(e,z1)-G(e,z2)||_1 / ||z1-z2||_1
+    Ayni embedding'den farkli gurultulerle uretilen ciktilar birbirine ne
+    kadar yakinsa, o kadar cezalandirilir (negatif isaret = mesafeyi
+    ARTIRMAYA tesvik) — decoder'in gurultuyu yoksayip tek bir "ortalama"
+    ciktiya cokmesini (mode collapse) engeller. Sadece
+    model.use_noise_injection=True VE loss.diversity_weight>0 iken cagrilir.
+    """
+    img_dist = (generated_a - generated_b).abs().mean(dim=[1, 2, 3])
+    z_dist = (noise_a - noise_b).abs().mean(dim=1)
+    return -(img_dist / (z_dist + eps)).mean()
+
+
+class ModelEMA:
+    """
+    Generator agirliklarinin EMA (exponential moving average) golge kopyasi.
+
+    Egitim adimlarindaki anlik gradyan gurultusunu/GAN salinimlarini
+    ortalar; StyleGAN/BigGAN gibi calismalarda hem daha keskin hem daha
+    stabil sonuc verdigi gozlemlenmistir. BatchNorm/InstanceNorm running
+    stats (buffer) EMA'lanmaz, dogrudan canli modelden kopyalanir (EMA'lanan
+    running stats egitim erken donemlerinde yanlis/kararsiz olabiliyor).
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model).eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for ema_p, p in zip(self.shadow.parameters(), model.parameters()):
+            ema_p.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+        for ema_b, b in zip(self.shadow.buffers(), model.buffers()):
+            ema_b.copy_(b)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.shadow.load_state_dict(state_dict)
+
+
+def _selection_score(identity_score: float, sharpness_ratio: float, weight: float) -> float:
+    """
+    Best checkpoint skoru (düşük = iyi).
+    identity_score + weight * (1 - min(sharpness_ratio, 1))
+    """
+    sharp_pen = 1.0 - min(float(sharpness_ratio), 1.0)
+    return float(identity_score) + weight * sharp_pen
+
+
 # ─── Transport Simulation (INT8 Roundtrip) ────────────────────────────────────
 
 def transport_simulate(embeddings: torch.Tensor) -> torch.Tensor:
@@ -232,8 +374,8 @@ def validate(model, loss_fn, val_loader, device, weights, writer, epoch, evaluat
         real_imgs  = real_imgs.to(device, non_blocking=True)
 
         generated = model(embeddings)
-        losses      = loss_fn(generated, real_imgs, weights)
-        eval_losses = loss_fn(generated, real_imgs, eval_weights)
+        losses      = loss_fn(generated, real_imgs, weights, input_embedding=embeddings)
+        eval_losses = loss_fn(generated, real_imgs, eval_weights, input_embedding=embeddings)
 
         for k, v in losses.items():
             total_losses[k] = total_losses.get(k, 0.0) + v.item()
@@ -297,6 +439,7 @@ def train(
         val_split=cfg.data.val_split,
         test_split=cfg.data.test_split,
         num_workers=cfg.data.num_workers,
+        max_samples=cfg.data.max_samples,
     )
     log.info(
         f"Train: {len(train_loader.dataset):,}  |  "
@@ -310,23 +453,39 @@ def train(
         initial_spatial=cfg.model.initial_spatial,
         initial_channels=cfg.model.initial_channels,
         decoder_channels=cfg.model.decoder_channels,
+        norm_type=cfg.model.norm_type,
+        use_noise_injection=cfg.model.use_noise_injection,
+        noise_dim=cfg.model.noise_dim,
     ).to(device)
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
     info = model.count_parameters()
     log.info(f"Model: {info['total_params']:,} parametre | {info['float32_mb']} MB (float32)")
+    if cfg.model.use_noise_injection:
+        log.info(
+            f"[Noise] Noise injection aktif: noise_dim={cfg.model.noise_dim}, "
+            f"diversity_weight={cfg.loss.diversity_weight}"
+        )
+    if cfg.loss.cycle_identity_weight > 0:
+        log.info(
+            f"[CycleID] cycle_identity_weight={cfg.loss.cycle_identity_weight} — "
+            f"YALNIZCA manifest embedding'leri identity encoder ile AYNI model "
+            f"ise anlamli (bkz. config.py yorumu)."
+        )
 
     # ── Discriminator (SADECE egitimde; export'a dahil edilmez) ──
     discriminator = None
     disc_optimizer = None
     disc_scaler = None
     if cfg.train.use_gan:
-        discriminator = PatchDiscriminator().to(device)
+        discriminator = PatchDiscriminator(
+            base_channels=cfg.train.disc_base_channels,
+        ).to(device)
         disc_optimizer = AdamW(
             discriminator.parameters(),
             lr=cfg.train.disc_lr,
-            betas=cfg.train.adam_betas,
+            betas=cfg.train.disc_betas,
         )
         disc_scaler = GradScaler("cuda", enabled=cfg.train.use_amp)
         d_info = discriminator.count_parameters()
@@ -336,7 +495,9 @@ def train(
         )
         log.info(
             f"[GAN] gan_start_epoch={cfg.train.gan_start_epoch}, "
-            f"adv_weight={cfg.train.adv_weight}, ramp={cfg.train.adv_weight_ramp_epochs} epoch"
+            f"adv_weight={cfg.train.adv_weight}, ramp={cfg.train.adv_weight_ramp_epochs} epoch, "
+            f"feat_match_weight={cfg.train.feat_match_weight}, "
+            f"gan_loss_type={cfg.train.gan_loss_type}, disc_betas={cfg.train.disc_betas}"
         )
 
     # ── Loss ───────────────────────────────────────────────────
@@ -344,6 +505,8 @@ def train(
         vgg_layer         = cfg.loss.vgg_layer,
         facenet_input_size = cfg.loss.facenet_input_size,
         arcface_r50_path  = cfg.loss.arcface_r50_path,
+        use_lpips         = cfg.loss.use_lpips,
+        lpips_net         = cfg.loss.lpips_net,
     ).to(device)
 
     # ── Bağımsız Evaluator (PDF v2.0 §7) ───────────────────────
@@ -383,6 +546,23 @@ def train(
         current_lr = optimizer.param_groups[0]["lr"]
         log.info(f"[Scheduler] {start_epoch} epoch ileri sarildi, guncel lr={current_lr:.2e}")
 
+    # ── Generator EMA ──────────────────────────────────────────
+    # Resume SONRASI olusturuluyor ki golge kopya, taze rastgele-init
+    # agirliklar yerine dogrudan (varsa resume edilmis) guncel model
+    # agirliklarindan baslasin.
+    ema = None
+    if cfg.train.use_ema:
+        ema = ModelEMA(model, decay=cfg.train.ema_decay)
+        if resume_from and Path(resume_from).exists():
+            ckpt_state = torch.load(resume_from, map_location=device)
+            if ckpt_state.get("model_ema") is not None:
+                ema.load_state_dict(ckpt_state["model_ema"])
+                log.info("[EMA] EMA golge agirliklari checkpoint'ten yuklendi.")
+            else:
+                log.info("[EMA] Checkpoint'te EMA yok - guncel model agirliklarindan baslatiliyor.")
+            del ckpt_state
+        log.info(f"[EMA] Aktif: decay={cfg.train.ema_decay}, eval_use_ema={cfg.train.eval_use_ema}")
+
     # ── TensorBoard ────────────────────────────────────────────
     writer = SummaryWriter(log_dir=cfg.train.log_dir)
 
@@ -391,7 +571,7 @@ def train(
 
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
-        weights     = cfg.get_loss_weights(epoch)
+        weights     = _augment_weights(cfg, cfg.get_loss_weights(epoch))
         epoch_loss  = 0.0
         step_count  = 0
 
@@ -404,23 +584,50 @@ def train(
             if device.type == "cuda":
                 real_imgs = real_imgs.contiguous(memory_format=torch.channels_last)
 
-            if cfg.train.transport_simulate:
+            use_transport = (
+                cfg.train.transport_simulate
+                and epoch >= cfg.train.transport_simulate_start_epoch
+            )
+            if use_transport:
                 embeddings = transport_simulate(embeddings)
+
+            use_diversity = cfg.model.use_noise_injection and cfg.loss.diversity_weight > 0
 
             optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", enabled=cfg.train.use_amp):
-                generated = model(embeddings)
-                losses    = loss_fn(generated, real_imgs, weights)
+                noise1 = None
+                if cfg.model.use_noise_injection:
+                    noise1 = torch.randn(embeddings.size(0), model.noise_dim, device=device)
+                generated = model(embeddings, noise=noise1)
+                losses    = loss_fn(generated, real_imgs, weights, input_embedding=embeddings)
                 g_total   = losses["total"]
 
                 if use_gan_this_epoch and adv_w > 0:
-                    fake_logits = discriminator(generated)
-                    adv_loss_g = F.binary_cross_entropy_with_logits(
-                        fake_logits, torch.ones_like(fake_logits)
+                    fake_logits, fake_feats = discriminator.forward_features(generated)
+                    with torch.no_grad():
+                        _, real_feats = discriminator.forward_features(real_imgs)
+                    adv_loss_g = _adv_loss_generator(fake_logits, cfg.train.gan_loss_type)
+                    fm_loss = _feature_matching_loss(fake_feats, real_feats)
+                    g_total = (
+                        g_total
+                        + adv_w * adv_loss_g
+                        + cfg.train.feat_match_weight * fm_loss
                     )
-                    g_total = g_total + adv_w * adv_loss_g
                 else:
                     adv_loss_g = torch.zeros((), device=device)
+                    fm_loss = torch.zeros((), device=device)
+
+                # ── Diversity / mode-seeking (MSGAN) ────────────────
+                # Ayni z ile ikinci bir gurultu ornegi kullanarak decoder'i
+                # tekrar calistirir; gurultuyu yoksayan bir decoder burada
+                # cezalandirilir (bkz. _diversity_loss docstring).
+                if use_diversity:
+                    noise2 = torch.randn(embeddings.size(0), model.noise_dim, device=device)
+                    generated_b = model(embeddings, noise=noise2)
+                    div_loss = _diversity_loss(generated, generated_b, noise1, noise2)
+                    g_total = g_total + cfg.loss.diversity_weight * div_loss
+                else:
+                    div_loss = torch.zeros((), device=device)
 
             scaler.scale(g_total).backward()
             scaler.unscale_(optimizer)
@@ -428,23 +635,33 @@ def train(
             scaler.step(optimizer)
             scaler.update()
 
+            if ema is not None:
+                ema.update(model)
+
             if use_gan_this_epoch:
                 disc_optimizer.zero_grad(set_to_none=True)
                 with autocast("cuda", enabled=cfg.train.use_amp):
                     real_logits = discriminator(real_imgs)
                     fake_logits_d = discriminator(generated.detach())
-                    d_loss_real = F.binary_cross_entropy_with_logits(
-                        real_logits, torch.full_like(real_logits, 0.9)
+                    d_loss = _adv_loss_discriminator(
+                        real_logits, fake_logits_d, cfg.train.gan_loss_type
                     )
-                    d_loss_fake = F.binary_cross_entropy_with_logits(
-                        fake_logits_d, torch.zeros_like(fake_logits_d)
-                    )
-                    d_loss = 0.5 * (d_loss_real + d_loss_fake)
-                disc_scaler.scale(d_loss).backward()
+
+                if cfg.train.r1_gamma > 0:
+                    # R1: tam hassasiyet, autocast DISINDA (cift backward AMP
+                    # altinda guvenilir degil).
+                    r1_pen = _r1_penalty(discriminator, real_imgs)
+                    d_loss_total = d_loss + 0.5 * cfg.train.r1_gamma * r1_pen
+                else:
+                    d_loss_total = d_loss
+                    r1_pen = torch.zeros((), device=device)
+
+                disc_scaler.scale(d_loss_total).backward()
                 disc_scaler.step(disc_optimizer)
                 disc_scaler.update()
             else:
                 d_loss = torch.zeros((), device=device)
+                r1_pen = torch.zeros((), device=device)
 
             epoch_loss += g_total.item()
             step_count += 1
@@ -452,34 +669,58 @@ def train(
             global_step = epoch * len(train_loader) + step
             if step % cfg.train.log_every_steps == 0:
                 lr = optimizer.param_groups[0]["lr"]
+                lpips_str = f"lpips={losses['lpips'].item():.4f}  " if cfg.loss.use_lpips else ""
+                cycle_str = (
+                    f"cyc_id={losses['cycle_identity'].item():.4f}  "
+                    if cfg.loss.cycle_identity_weight > 0 else ""
+                )
+                div_str = f"div={div_loss.item():.4f}  " if use_diversity else ""
+                r1_str = f"r1={r1_pen.item():.4f}  " if cfg.train.r1_gamma > 0 else ""
                 log.info(
                     f"Epoch {epoch+1:3d}/{cfg.train.epochs} "
                     f"Step {step:5d}/{len(train_loader)} "
                     f"loss={losses['total'].item():.4f}  "
                     f"id={losses['identity'].item():.4f}  "
                     f"perc={losses['perceptual'].item():.4f}  "
+                    f"{lpips_str}{cycle_str}{div_str}"
                     f"adv_g={adv_loss_g.item():.4f}  "
+                    f"fm={fm_loss.item():.4f}  "
                     f"d_loss={d_loss.item():.4f}  "
+                    f"{r1_str}"
                     f"lr={lr:.2e}"
                 )
                 for k, v in losses.items():
                     writer.add_scalar(f"train/{k}", v.item(), global_step)
                 if use_gan_this_epoch:
                     writer.add_scalar("train/adv_g", adv_loss_g.item(), global_step)
+                    writer.add_scalar("train/feat_match", fm_loss.item(), global_step)
                     writer.add_scalar("train/d_loss", d_loss.item(), global_step)
                     writer.add_scalar("train/adv_weight", adv_w, global_step)
+                    if cfg.train.r1_gamma > 0:
+                        writer.add_scalar("train/r1_penalty", r1_pen.item(), global_step)
+                if use_diversity:
+                    writer.add_scalar("train/diversity", div_loss.item(), global_step)
                 writer.add_scalar("train/lr", lr, global_step)
 
         scheduler.step()
 
         # ── Validation ─────────────────────────────────────────
-        val_losses = validate(model, loss_fn, val_loader, device, weights, writer, epoch, evaluator=evaluator)
+        # eval_use_ema aktifse validation/checkpoint-secimi EMA golge
+        # kopyasi uzerinden yapilir (genellikle daha keskin/stabil).
+        eval_model = ema.shadow if (ema is not None and cfg.train.eval_use_ema) else model
+        val_losses = validate(eval_model, loss_fn, val_loader, device, weights, writer, epoch, evaluator=evaluator)
         val_id_score = val_losses["identity_score"]
+        val_selection = _selection_score(
+            val_id_score,
+            val_losses["sharpness_ratio"],
+            cfg.train.sharpness_ckpt_weight,
+        )
 
         log.info(
             f"[Val] epoch={epoch+1}  "
             f"total={val_losses['total']:.4f}  "
             f"identity_score(raw_loss, dusuk_iyi)={val_id_score:.4f}  "
+            f"selection={val_selection:.4f}  "
             f"PSNR={val_losses['psnr_db']:.2f}dB  "
             f"SSIM={val_losses['ssim_raw']:.4f}  "
             f"sharpness_ratio={val_losses['sharpness_ratio']:.3f}  "
@@ -487,6 +728,8 @@ def train(
             f"best={best_val_score:.4f}  "
             f"gan_aktif={use_gan_this_epoch}"
         )
+        if writer:
+            writer.add_scalar("val/selection_score", val_selection, epoch)
 
         # ── Bağımsız Evaluator (PDF v2.0 §7) ───────────────────
         if (evaluator is not None
@@ -506,10 +749,10 @@ def train(
                 writer.add_scalar("eval/independent_cosine_sim", indep_mean, epoch)
             model.train()
 
-        # ── Checkpoint ─────────────────────────────────────────
-        is_best = val_id_score < best_val_score - cfg.train.min_delta
+        # ── Checkpoint (identity + sharpness composite) ────────
+        is_best = val_selection < best_val_score - cfg.train.min_delta
         if is_best:
-            best_val_score = val_id_score
+            best_val_score = val_selection
             patience_ctr   = 0
         else:
             patience_ctr  += 1
@@ -525,6 +768,7 @@ def train(
                     "config":         asdict(cfg) if is_dataclass(cfg) else cfg,
                     "discriminator":  discriminator.state_dict() if discriminator is not None else None,
                     "disc_optimizer": disc_optimizer.state_dict() if disc_optimizer is not None else None,
+                    "model_ema":      ema.state_dict() if ema is not None else None,
                 },
                 save_dir=cfg.train.save_dir,
                 epoch=epoch + 1,
@@ -536,7 +780,7 @@ def train(
         if patience_ctr >= cfg.train.patience:
             log.info(
                 f"Early stopping: {cfg.train.patience} epoch boyunca "
-                f"val identity score iyilesmedi. Son score: {best_val_score:.4f}"
+                f"val selection score iyilesmedi. Son score: {best_val_score:.4f}"
             )
             break
 
@@ -544,7 +788,11 @@ def train(
     best_ckpt = Path(cfg.train.save_dir) / "best_model.pt"
     if best_ckpt.exists():
         state = torch.load(best_ckpt, map_location=device)
-        model.load_state_dict(state["model"])
+        if cfg.train.use_ema and cfg.train.eval_use_ema and state.get("model_ema") is not None:
+            model.load_state_dict(state["model_ema"])
+            log.info("[EMA] Nihai test icin EMA agirliklari yuklendi.")
+        else:
+            model.load_state_dict(state["model"])
     model.eval()
 
     test_id_scores = []
@@ -553,7 +801,10 @@ def train(
             emb_b  = emb_b.to(device)
             real_b = real_b.to(device)
             gen_b  = model(emb_b)
-            losses = loss_fn(gen_b, real_b, cfg.loss.phase3_weights)
+            losses = loss_fn(
+                gen_b, real_b, _augment_weights(cfg, cfg.loss.phase3_weights),
+                input_embedding=emb_b,
+            )
             test_id_scores.append(1.0 - losses["identity"].item())
             if evaluator is not None:
                 indep_score = evaluator.cosine_sim(gen_b, real_b)
@@ -568,7 +819,10 @@ def train(
         writer.add_scalar("test/identity_similarity", test_mean, 0)
 
     writer.close()
-    log.info(f"Eğitim tamamlandı. En iyi val identity score (raw loss): {best_val_score:.4f}")
+    log.info(
+        f"Eğitim tamamlandı. En iyi val selection score "
+        f"(identity + sharpness): {best_val_score:.4f}"
+    )
 
     return str(best_ckpt)
 

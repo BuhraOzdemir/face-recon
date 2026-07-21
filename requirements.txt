@@ -11,3 +11,6 @@ tensorboard>=2.14.0
 torchmetrics>=1.2.0
 pytorch-msssim>=1.0.0
 timm>=0.9.0
+# Opsiyonel: config.loss.use_lpips=True iken gerekli (Kaggle'da:
+# !pip install -q lpips)
+lpips>=0.1.4

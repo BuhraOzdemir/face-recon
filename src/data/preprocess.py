@@ -70,9 +70,12 @@ def load_insightface_app(det_size=(320, 320)):
     return app
 
 
-def align_and_embed(app, img_bgr: np.ndarray, output_size: int = 128):
+def align_and_embed(app, img_bgr: np.ndarray, output_size: int = 128, align_size: int = 128):
     """
     BGR görüntüden yüzü tespit et, hizala ve ArcFace embedding üret.
+
+    align_size: norm_crop çıktı boyutu. Varsayılan 128 — 112→128 soft upsample yok.
+    output_size ile aynı tutulması önerilir.
 
     Returns:
         aligned_rgb: (output_size, output_size, 3) uint8 RGB
@@ -86,7 +89,7 @@ def align_and_embed(app, img_bgr: np.ndarray, output_size: int = 128):
     face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
     embedding = face.normed_embedding.astype(np.float32)
 
-    aligned_bgr = _manual_align(app, img_bgr, face)
+    aligned_bgr = _manual_align(app, img_bgr, face, image_size=align_size)
     if aligned_bgr is None:
         return None, None
 
@@ -99,13 +102,13 @@ def align_and_embed(app, img_bgr: np.ndarray, output_size: int = 128):
     return aligned_rgb, embedding
 
 
-def _manual_align(app, img_bgr: np.ndarray, face) -> Optional[np.ndarray]:
+def _manual_align(app, img_bgr: np.ndarray, face, image_size: int = 128) -> Optional[np.ndarray]:
     from insightface.utils import face_align
 
     kps = face.kps
     if kps is None:
         return None
-    return face_align.norm_crop(img_bgr, landmark=kps, image_size=112)
+    return face_align.norm_crop(img_bgr, landmark=kps, image_size=image_size)
 
 
 def _is_shards_dir(path: Path) -> bool:
@@ -166,7 +169,9 @@ def preprocess_dataset(
     raw_dir: str,
     out_dir: str,
     output_size: int = 128,
+    align_size: int = 128,
     max_per_id: int = 100,
+    max_samples: int = 100_000,
     skip_existing: bool = True,
     images_per_shard: int = DEFAULT_IMAGES_PER_SHARD,
     min_free_gb: float = 2.0,
@@ -205,6 +210,13 @@ def preprocess_dataset(
         log.info(f"Girdi formati: klasor ({raw_path})")
         samples = _collect_folder_samples(raw_path, max_per_id)
 
+    if max_samples and max_samples > 0 and len(samples) > max_samples:
+        log.info(
+            f"max_samples={max_samples:,}: {len(samples):,} aday → "
+            f"ilk {max_samples:,} ornek islenecek"
+        )
+        samples = samples[:max_samples]
+
     log.info(f"{len(samples):,} goruntu islenecek.")
     log.info("insightface yukleniyor...")
     app = load_insightface_app()
@@ -235,7 +247,9 @@ def preprocess_dataset(
                 total_fail += 1
                 continue
 
-            aligned, emb = align_and_embed(app, img_bgr, output_size)
+            aligned, emb = align_and_embed(
+                app, img_bgr, output_size=output_size, align_size=align_size
+            )
             if aligned is None:
                 total_fail += 1
                 continue
@@ -271,11 +285,23 @@ def preprocess_dataset(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Yüz veri seti ön işleme")
-    parser.add_argument("--raw_dir", required=True, help="Ham görüntü / shard klasörü")
-    parser.add_argument("--out_dir", required=True, help="Çıktı klasörü")
+    parser = argparse.ArgumentParser(description="Yuz veri seti on isleme")
+    parser.add_argument("--raw_dir", required=True, help="Ham goruntu / shard klasoru")
+    parser.add_argument("--out_dir", required=True, help="Cikti klasoru")
     parser.add_argument("--output_size", default=128, type=int)
+    parser.add_argument(
+        "--align_size",
+        default=128,
+        type=int,
+        help="norm_crop boyutu (varsayilan 128; 112 soft upsample uretir)",
+    )
     parser.add_argument("--max_per_id", default=100, type=int)
+    parser.add_argument(
+        "--max_samples",
+        default=100_000,
+        type=int,
+        help="Islenecek toplam ornek ust siniri (0=sinirsiz)",
+    )
     parser.add_argument("--no_skip", action="store_true")
     args = parser.parse_args()
 
@@ -283,6 +309,8 @@ if __name__ == "__main__":
         raw_dir=args.raw_dir,
         out_dir=args.out_dir,
         output_size=args.output_size,
+        align_size=args.align_size,
         max_per_id=args.max_per_id,
+        max_samples=args.max_samples,
         skip_existing=not args.no_skip,
     )

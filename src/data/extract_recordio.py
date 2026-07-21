@@ -49,6 +49,7 @@ def extract_ms1mv3(
     extracted_dir: str,
     max_per_id: int = 15,
     max_ids: int = 93000,
+    max_samples: int = 100_000,
     skip_if_exists: bool = True,
     min_free_gb: float = 2.0,
     min_free_inodes: int = DEFAULT_MIN_FREE_INODES,
@@ -63,6 +64,7 @@ def extract_ms1mv3(
         extracted_dir:     çıktı klasörü (örn. /kaggle/working/ms1mv3_shards)
         max_per_id:        kimlik başına max görüntü
         max_ids:           işlenecek max kimlik (class_id üst sınırı)
+        max_samples:       toplam görüntü üst sınırı (0=sınırsız)
         skip_if_exists:    shard_*.tar zaten varsa atla
         min_free_gb:       disk eşiği — altında güvenli dur
         min_free_inodes:   inode eşiği — altında güvenli dur
@@ -190,6 +192,15 @@ def extract_ms1mv3(
                     except Exception:
                         errors += 1
                         continue
+
+                    if max_samples and max_samples > 0 and writer.n_written >= max_samples:
+                        stopped_early = True
+                        stop_reason = f"max_samples={max_samples}"
+                        print(
+                            f"\n[DUR] max_samples={max_samples:,} ulasildi. "
+                            f"Shard kapatilip guvenli cikiliyor."
+                        )
+                        break
     finally:
         writer.close()
 
