@@ -54,10 +54,9 @@ class NoiseModulation(nn.Module):
 
 def _make_norm(norm_type: str, channels: int) -> nn.Module:
     """
-    "batch" (varsayılan) veya "instance". Instance norm GAN eğitiminde
-    batch istatistiği sızıntısını (ve bunun neden olabileceği ortalama-yüz
-    eğilimini) azaltabilir, ama state_dict anahtarları/davranışı farklı
-    olduğu için "batch" ile eğitilmiş checkpoint'lerle UYUMSUZDUR.
+    "batch" (varsayılan) veya "instance".
+    state_dict anahtarları farklı olduğu için norm_type değiştirilince
+    eski checkpoint'lerle UYUMSUZDUR.
     """
     if norm_type == "batch":
         return nn.BatchNorm2d(channels)
@@ -93,6 +92,10 @@ class UpsampleBlock(nn.Module):
 
     Conv → PixelShuffle öğrenilebilir yüksek frekans üretir;
     bilinear'e göre daha az soft blur.
+
+    ── Cascade skip (opsiyonel) ──
+    Bloğun girdisi 1×1 conv + nearest-upsample ile çıktıya eklenir.
+    Kapalıyken mimari birebir aynı kalır.
     """
 
     def __init__(
@@ -102,6 +105,7 @@ class UpsampleBlock(nn.Module):
         norm_type: str = "batch",
         use_noise_injection: bool = False,
         noise_style_dim: int = 64,
+        use_cascade_skip: bool = False,
     ):
         super().__init__()
         self.up = nn.Sequential(
@@ -116,11 +120,24 @@ class UpsampleBlock(nn.Module):
         self.res1 = DWResBlock(out_ch, norm_type=norm_type)
         self.res2 = DWResBlock(out_ch, norm_type=norm_type)
 
+        self.use_cascade_skip = use_cascade_skip
+        if use_cascade_skip:
+            self.skip_proj = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.Upsample(scale_factor=2, mode="nearest"),
+            )
+            # Sıfır-init: ilk forward'da skip'siz hallle matematiksel özdeş
+            nn.init.zeros_(self.skip_proj[0].weight)
+
     def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
+        skip_input = x
         x = self.up(x)
         if self.use_noise_injection and w is not None:
             x = self.noise_mod(x, w)
-        return self.res2(self.res1(x))
+        out = self.res2(self.res1(x))
+        if self.use_cascade_skip:
+            out = out + self.skip_proj(skip_input)
+        return out
 
 
 # ─── Ana model ─────────────────────────────────────────────────────────────────
@@ -135,6 +152,8 @@ class FaceDecoder(nn.Module):
         initial_channels (int): İlk feature map kanal sayısı. Varsayılan: 192.
         decoder_channels (tuple): Her UpsampleBlock'un çıktı kanalları.
             Varsayılan: (192, 128, 96, 64, 32) → 5 blok → 4→128 px.
+        use_cascade_skip (bool): Opsiyonel cascade skip.
+        cascade_skip_last_n_blocks (int): Skip alan son N upsample bloğu.
 
     Forward:
         z: (B, embedding_dim) → output: (B, 3, 128, 128), aralık [-1, 1]
@@ -149,6 +168,8 @@ class FaceDecoder(nn.Module):
         norm_type: str = "batch",
         use_noise_injection: bool = False,
         noise_dim: int = 64,
+        use_cascade_skip: bool = False,
+        cascade_skip_last_n_blocks: int = 2,
     ):
         super().__init__()
 
@@ -180,12 +201,22 @@ class FaceDecoder(nn.Module):
 
         # 5× UpsampleBlock:  4→8→16→32→64→128
         channels = [initial_channels] + list(decoder_channels)
+        n_blocks = len(decoder_channels)
+        # Cascade skip: sadece son N bloğa uygulanır (<5MB INT8 bütçesi)
+        # (mobil INT8 <5MB bütçesi). Kapalıyken mimari birebir aynı.
+        self.use_cascade_skip = use_cascade_skip
+        self.cascade_skip_last_n_blocks = cascade_skip_last_n_blocks
+        skip_flags = [
+            use_cascade_skip and (i >= n_blocks - cascade_skip_last_n_blocks)
+            for i in range(n_blocks)
+        ]
         self.up_blocks = nn.ModuleList([
             UpsampleBlock(
                 channels[i], channels[i + 1], norm_type=norm_type,
                 use_noise_injection=use_noise_injection, noise_style_dim=noise_dim,
+                use_cascade_skip=skip_flags[i],
             )
-            for i in range(len(decoder_channels))
+            for i in range(n_blocks)
         ])
 
         # Çıktı katmanı: son kanal sayısı → RGB, Tanh [-1, 1]
@@ -202,6 +233,11 @@ class FaceDecoder(nn.Module):
             for m in self.modules():
                 if isinstance(m, NoiseModulation):
                     m.reset_parameters()
+        if use_cascade_skip:
+            # _init_weights Kaiming'i skip_proj'u ezer — sıfır-init'i yenile
+            for block in self.up_blocks:
+                if block.use_cascade_skip:
+                    nn.init.zeros_(block.skip_proj[0].weight)
 
     def _init_weights(self):
         for m in self.modules():

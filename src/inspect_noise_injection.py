@@ -138,6 +138,8 @@ def _build_model_from_checkpoint(checkpoint_path: str, cfg: Config, device: torc
             norm_type=m.get("norm_type", "batch"),
             use_noise_injection=m.get("use_noise_injection", False),
             noise_dim=m.get("noise_dim", 64),
+            use_cascade_skip=m.get("use_cascade_skip", False),
+            cascade_skip_last_n_blocks=m.get("cascade_skip_last_n_blocks", 2),
         ).to(device)
     else:
         log.warning(
@@ -152,6 +154,8 @@ def _build_model_from_checkpoint(checkpoint_path: str, cfg: Config, device: torc
             norm_type=cfg.model.norm_type,
             use_noise_injection=cfg.model.use_noise_injection,
             noise_dim=cfg.model.noise_dim,
+            use_cascade_skip=cfg.model.use_cascade_skip,
+            cascade_skip_last_n_blocks=cfg.model.cascade_skip_last_n_blocks,
         ).to(device)
 
     model.load_state_dict(state["model"])

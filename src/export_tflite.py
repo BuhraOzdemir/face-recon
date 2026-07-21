@@ -33,6 +33,11 @@ def load_model_from_checkpoint(ckpt_path: str, cfg: Config) -> FaceDecoder:
         initial_spatial=cfg.model.initial_spatial,
         initial_channels=cfg.model.initial_channels,
         decoder_channels=cfg.model.decoder_channels,
+        norm_type=getattr(cfg.model, "norm_type", "batch"),
+        use_noise_injection=getattr(cfg.model, "use_noise_injection", False),
+        noise_dim=getattr(cfg.model, "noise_dim", 64),
+        use_cascade_skip=getattr(cfg.model, "use_cascade_skip", False),
+        cascade_skip_last_n_blocks=getattr(cfg.model, "cascade_skip_last_n_blocks", 2),
     )
     model.load_state_dict(state["model"])
     model.eval()
