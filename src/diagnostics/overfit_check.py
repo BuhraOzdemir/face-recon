@@ -28,9 +28,9 @@ from torch.optim import AdamW
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
 
-from .config import Config
-from .data.dataset import _load_manifest_samples, FaceDataset, build_val_transform, denormalize
-from .models.decoder import FaceDecoder
+from ..config import Config
+from ..data.dataset import _load_manifest_samples, FaceDataset, build_val_transform, denormalize
+from ..models.decoder import FaceDecoder
 
 log = logging.getLogger(__name__)
 

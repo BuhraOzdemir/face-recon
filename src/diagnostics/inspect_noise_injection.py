@@ -39,9 +39,9 @@ from pathlib import Path
 import torch
 import matplotlib.pyplot as plt
 
-from .config import Config
-from .data.dataset import build_dataloaders, denormalize
-from .models.decoder import FaceDecoder, NoiseModulation
+from ..config import Config
+from ..data.dataset import build_dataloaders, denormalize
+from ..models.decoder import FaceDecoder, NoiseModulation
 
 log = logging.getLogger(__name__)
 
