@@ -154,6 +154,47 @@ class ModelEMA:
         self.shadow.load_state_dict(state_dict)
 
 
+def _recalibrate_bn(model: nn.Module, loader, device: torch.device, max_batches: int = 100):
+    """
+    EMA gölge modelinin BatchNorm running_mean/var'ını KENDİ (yumuşatılmış)
+    ağırlıklarına göre yeniden hesaplar — torch.optim.swa_utils.update_bn
+    ile aynı yöntem: running stats sıfırlanır, momentum=None (kümülatif
+    hareketli ortalama) yapılır, train() modunda gradyansız birkaç batch
+    ileri geçirilir, sonra momentum eski haline döner.
+
+    NEDEN: ModelEMA.update() buffer'ları (running_mean/var) CANLI modelden
+    doğrudan kopyalar — bu istatistikler CANLI ağırlıkların ürettiği
+    aktivasyon dağılımını yansıtır, ama golge modelin YUMUŞATILMIŞ
+    (decay≈0.999 → ~1000 adımlık gecikme) ağırlıklarına uygulanır. Bu
+    uyumsuzluk düşük-frekans (renk) sinyalini az etkiler ama yüksek-frekans
+    (doku) detayında gözle görülür bozulmaya yol açar (bkz. proje notları).
+
+    Sadece nn.BatchNorm2d etkilenir — norm_type="instance" ile no-op'tur
+    (InstanceNorm2d'de running stats yok).
+    """
+    bn_modules = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+    if not bn_modules or max_batches <= 0:
+        return
+
+    original_momenta = {m: m.momentum for m in bn_modules}
+    for m in bn_modules:
+        m.reset_running_stats()
+        m.momentum = None  # kümülatif hareketli ortalama
+
+    was_training = model.training
+    model.train()
+    with torch.no_grad():
+        for i, (embeddings, _real_imgs) in enumerate(loader):
+            if i >= max_batches:
+                break
+            embeddings = embeddings.to(device, non_blocking=True)
+            model(embeddings)
+
+    for m in bn_modules:
+        m.momentum = original_momenta[m]
+    model.train(was_training)
+
+
 def _selection_score(identity_score: float, sharpness_ratio: float, weight: float) -> float:
     """Best checkpoint skoru (düşük = iyi)."""
     sharp_pen = 1.0 - min(float(sharpness_ratio), 1.0)
@@ -381,7 +422,10 @@ def train(
             else:
                 log.info("[EMA] Checkpoint'te EMA yok - guncel model agirliklarindan baslatiliyor.")
             del ckpt_state
-        log.info(f"[EMA] Aktif: decay={cfg.train.ema_decay}, eval_use_ema={cfg.train.eval_use_ema}")
+        log.info(
+            f"[EMA] Aktif: decay={cfg.train.ema_decay}, eval_use_ema={cfg.train.eval_use_ema}, "
+            f"bn_recalib_batches={cfg.train.ema_bn_recalib_batches}"
+        )
 
     writer = SummaryWriter(log_dir=cfg.train.log_dir)
     log.info(f"Eğitim başlıyor: {cfg.train.epochs} epoch")
@@ -456,7 +500,13 @@ def train(
 
         scheduler.step()
 
-        eval_model = ema.shadow if (ema is not None and cfg.train.eval_use_ema) else model
+        use_ema_for_eval = ema is not None and cfg.train.eval_use_ema
+        eval_model = ema.shadow if use_ema_for_eval else model
+        if use_ema_for_eval and cfg.train.ema_bn_recalib_batches > 0:
+            _recalibrate_bn(
+                eval_model, train_loader, device,
+                max_batches=cfg.train.ema_bn_recalib_batches,
+            )
         val_losses = validate(
             eval_model, loss_fn, val_loader, device, weights, writer, epoch,
             evaluator=evaluator,

@@ -241,7 +241,11 @@ class FaceDecoder(nn.Module):
                     nn.init.zeros_(block.skip_proj[0].weight)
 
     def _init_weights(self):
+        out_conv = self.output_conv[0]
         for m in self.modules():
+            if m is out_conv:
+                # Tanh'a besleyen son katman - asagida AYRI ve UYGUN init alir.
+                continue
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
                 if m.bias is not None:
@@ -255,6 +259,20 @@ class FaceDecoder(nn.Module):
                     nn.init.ones_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        # ── output_conv: Tanh-uyumlu init ───────────────────────────
+        # Kaiming(nonlinearity="leaky_relu") ReLU-ailesi aktivasyonlar icin
+        # ileri-yon varyansini korumaya gore kalibre edilmistir; Tanh gibi
+        # DOYAN (saturating) bir aktivasyona bu gain'i uygulamak, ozellikle
+        # bu katmanin fan_out'u kucuk oldugundan (3 kanal -> std~0.27),
+        # pre-aktivasyonlari erken doygunluga (|x|>2-3) itebilir. Doygun
+        # Tanh -> vanishing gradient -> R/G/B kanallarindaki rastgele
+        # init dengesizligi egitimle duzelemez (periyodik/kanal-baskin
+        # gurultu semptomuyla ortusuyor). Xavier/Glorot + tanh gain,
+        # PyTorch'un bu aktivasyon icin onerdigi standart eslesmedir.
+        nn.init.xavier_normal_(out_conv.weight, gain=nn.init.calculate_gain("tanh"))
+        if out_conv.bias is not None:
+            nn.init.zeros_(out_conv.bias)
 
     def forward(
         self,

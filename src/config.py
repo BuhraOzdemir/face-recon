@@ -114,6 +114,17 @@ class TrainConfig:
     ema_decay: float = 0.999
     eval_use_ema: bool = True
 
+    # EMA + BatchNorm uyumsuzluğu düzeltmesi: ModelEMA.update() running_mean/
+    # var'ı CANLI modelden doğrudan kopyalar (buffer'ları EMA'lamak DAHA
+    # yanlış olurdu), ama bu istatistikler golge modelin YUMUŞATILMIŞ
+    # (decay=0.999 → ~1000 adımlık gecikme) ağırlıklarına uygulanır — düşük-
+    # frekans (renk) sinyalini az etkiler, yüksek-frekans (doku) detayında
+    # gözle görülür bozulmaya yol açar. Her epoch validation'dan ÖNCE, EMA
+    # gölge modelinin BatchNorm istatistiklerini KENDİ ağırlıklarına göre
+    # yeniden hesaplar (torch.optim.swa_utils.update_bn ile aynı yöntem).
+    # 0 = kapalı. norm_type="instance" iken no-op'tur (running stats yok).
+    ema_bn_recalib_batches: int = 100
+
 
 @dataclass
 class ExportConfig:
@@ -184,3 +195,34 @@ SMALL_CONFIG = Config(
 )
 
 MEDIUM_CONFIG = DEFAULT_CONFIG
+
+# ── Kısa izole test config'i (init-fix DOĞRULAMASI) ────────────────────────────
+# Amaç: "önceki 15-epoch GAN'sız/cascade'siz/EMA'lı testinizle" BİREBİR AYNI
+# ayarlar — TEK FARK decoder.py'nin artık düzeltilmiş output_conv init'i
+# kullanması (bu otomatik gelir, flag gerekmez). Faz zamanlaması KASITLI
+# olarak DEĞİŞTİRİLMEDİ ki "sadece init değişikliği neyi düzeltti" sorusuna
+# net cevap alınabilsin.
+#
+# UYARI: phase1_epochs=10 varsayılanı, bu 15-epoch'luk bütçenin 10'unu
+# (%67'sini) identity=0 olan salt L1+perceptual "ısınma" fazında tüketiyor —
+# yani identity-ayırt edici sinyal ancak epoch 10'da başlıyor ve sadece 5
+# epoch çalışıyor. Bu, "farklı embedding'ler neredeyse özdeş çıktı üretiyor"
+# gözleminizin (init'ten BAĞIMSIZ) ikinci bir olası nedeni — bkz. QUICK_TEST_PHASE_FIX_CONFIG.
+QUICK_TEST_CONFIG = Config(
+    data=DataConfig(max_samples=100_000),
+    model=ModelConfig(use_cascade_skip=False, use_noise_injection=False),
+    train=TrainConfig(epochs=15, use_ema=True, eval_use_ema=True),
+)
+
+# ── Kısa izole test config'i + faz zamanlaması düzeltmesi ──────────────────────
+# QUICK_TEST_CONFIG ile AYNI, TEK FARK: identity-ayırt edici sinyal 15 epoch'un
+# çoğunu değil küçük bir kısmını "kör" geçiriyor. 10/50/40 oranı (100 epoch'luk
+# TAM eğitim için tasarlanmış) 15 epoch'a orantılı ölçeklendi: 2/7/6.
+# İki config'i AYRI AYRI çalıştırıp karşılaştırın — hangisi "tek değişken"
+# ilkesini bozmadan asıl faktörü izole eder.
+QUICK_TEST_PHASE_FIX_CONFIG = Config(
+    data=DataConfig(max_samples=100_000),
+    model=ModelConfig(use_cascade_skip=False, use_noise_injection=False),
+    loss=LossConfig(phase1_epochs=2, phase2_epochs=7, phase3_epochs=6),
+    train=TrainConfig(epochs=15, use_ema=True, eval_use_ema=True),
+)
