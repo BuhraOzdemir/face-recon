@@ -134,6 +134,136 @@ def run_random_val_check(
     return {"real_stats": real_stats, "gen_stats": gen_stats, "diff": diff, "indices": idx}
 
 
+# ─── R/B swap testi ─────────────────────────────────────────────────────────
+
+def _mean_abs_diff_per_channel(a: torch.Tensor, b: torch.Tensor) -> list:
+    """a,b: [-1,1] tensörler (aynı shape). Denormalize SONRASI [0,1] kanal-başı MAD."""
+    a01, b01 = denormalize(a), denormalize(b)
+    return (a01 - b01).abs().mean(dim=[0, 2, 3]).tolist()
+
+
+def run_rb_swap_test(
+    cfg: Config,
+    manifest_path: str,
+    checkpoint_path: str,
+    n_samples: int = 16,
+    seed: int = 123,
+    save_path: str = "/kaggle/working/rb_swap_test.png",
+) -> dict:
+    """
+    R/B swap testi: generated[:, [2,1,0], :, :] gerçeğe DAHA MI yakın?
+    - Yakınsa (MAD belirgin azalıyorsa): pipeline'da bir yerde R/B karışıklığı var.
+    - Yakınsamıyorsa: output_conv.weight'in çıkış-kanalı-başı L2 normlarına bakılır
+      (bias zaten öğrenilmiş-bias hipotezini elemişti — sıradaki şüpheli AĞIRLIK).
+
+    seed=123, run_random_val_check ile AYNI varsayılan — istenirse aynı
+    indekslerin tekrar kullanılması için.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model, state = build_model_from_checkpoint(checkpoint_path, cfg, device)
+    model.eval()
+    log.info(f"[R/B Swap Test] Checkpoint: epoch={state.get('epoch')}")
+
+    from ..data.dataset import build_dataloaders
+
+    _, val_loader, _ = build_dataloaders(
+        manifest_path=manifest_path, image_size=cfg.data.image_size,
+        batch_size=cfg.train.batch_size, val_split=cfg.data.val_split,
+        test_split=cfg.data.test_split, num_workers=0, max_samples=cfg.data.max_samples,
+    )
+    embeddings, real_imgs, idx = _sample_random_val_items(val_loader, n_samples, seed)
+    embeddings, real_imgs = embeddings.to(device), real_imgs.to(device)
+    log.info(f"[R/B Swap Test] Seçilen indeksler (seed={seed}): {idx}")
+
+    with torch.no_grad():
+        generated = model(embeddings)
+    generated_swapped = generated[:, [2, 1, 0], :, :]
+
+    mad_before = _mean_abs_diff_per_channel(generated, real_imgs)
+    mad_after = _mean_abs_diff_per_channel(generated_swapped, real_imgs)
+    total_before = sum(mad_before)
+    total_after = sum(mad_after)
+    improvement = 1.0 - (total_after / max(total_before, 1e-8))
+
+    log.info("=" * 100)
+    log.info("R/B SWAP TESTİ ([0,1] denormalize sonrası, gerçeğe ortalama-mutlak-fark)")
+    log.info(f"  Swap ÖNCESİ  MAD(R,G,B) = ({mad_before[0]:.4f},{mad_before[1]:.4f},{mad_before[2]:.4f})  toplam={total_before:.4f}")
+    log.info(f"  Swap SONRASI MAD(R,G,B) = ({mad_after[0]:.4f},{mad_after[1]:.4f},{mad_after[2]:.4f})  toplam={total_after:.4f}")
+    log.info(f"  İyileşme oranı = {improvement:+.1%}")
+    log.info("-" * 100)
+
+    swap_fixed_it = improvement > 0.30
+    if swap_fixed_it:
+        log.info(
+            "SONUÇ: SWAP DÜZELTTİ — toplam fark %30'dan fazla azaldı. Pipeline'ın bir "
+            "yerinde R/B karışıklığı VAR (öğrenilmiş bias/ağırlık DEĞİL). preprocess.py "
+            "ile eğitim/inference girdisi arasındaki her adımı (özellikle inference "
+            "tarafında img normalizasyonu/kanal sırası) tekrar karşılaştırmak gerekir."
+        )
+    else:
+        log.info(
+            "SONUÇ: SWAP DÜZELTMEDİ (veya kötüleştirdi) — kanal karışıklığı değil. "
+            "output_conv.weight'in çıkış-kanalı-başı L2 normuna bakılıyor..."
+        )
+
+    # ── output_conv.weight per-çıkış-kanalı L2 norm (bias zaten elenmişti) ──
+    out_conv_weight = None
+    for name, p in model.named_parameters():
+        if name == "output_conv.0.weight":
+            out_conv_weight = p.detach()
+            break
+    weight_norms = None
+    if out_conv_weight is not None:
+        # (3, in_ch, k, k) -> her cikis kanali (R,G,B) icin ayri L2 norm
+        weight_norms = out_conv_weight.reshape(out_conv_weight.size(0), -1).norm(dim=1).tolist()
+        spread = max(weight_norms) - min(weight_norms)
+        rel_spread = spread / max(weight_norms)
+        log.info(
+            f"  output_conv.weight L2 norm (R,G,B) = "
+            f"({weight_norms[0]:.4f},{weight_norms[1]:.4f},{weight_norms[2]:.4f})  "
+            f"göreli fark={rel_spread:.1%}"
+        )
+        if not swap_fixed_it and rel_spread > 0.25:
+            log.info(
+                "  -> Kanallar arası ağırlık normu farkı BELİRGİN (>%25) — output_conv."
+                "weight'te kanal-bazlı asimetri, renk kaymasının kaynağı olabilir."
+            )
+        elif not swap_fixed_it:
+            log.info(
+                "  -> Ağırlık normları da birbirine yakın — kaynak ne swap ne de "
+                "output_conv ağırlığı gibi görünüyor, daha derin bir katmanda "
+                "(örn. son BatchNorm) aranmalı."
+            )
+    log.info("=" * 100)
+
+    # ── Görselleştirme ───────────────────────────────────────────────
+    real_np = denormalize(real_imgs.cpu()).permute(0, 2, 3, 1).numpy()
+    gen_np = denormalize(generated.cpu()).permute(0, 2, 3, 1).numpy()
+    swap_np = denormalize(generated_swapped.cpu()).permute(0, 2, 3, 1).numpy()
+    B = embeddings.size(0)
+    fig, axes = plt.subplots(3, B, figsize=(2.2 * B, 2.2 * 3), squeeze=False)
+    for c in range(B):
+        axes[0, c].imshow(real_np[c].clip(0, 1)); axes[0, c].axis("off")
+        axes[1, c].imshow(gen_np[c].clip(0, 1)); axes[1, c].axis("off")
+        axes[2, c].imshow(swap_np[c].clip(0, 1)); axes[2, c].axis("off")
+    for r, title in enumerate(["Gerçek", "Üretilen (orijinal)", "Üretilen (R/B swap)"]):
+        axes[r, 0].text(-0.3, 0.5, title, fontsize=9, ha="right", va="center",
+                         transform=axes[r, 0].transAxes)
+    plt.suptitle(f"R/B Swap Testi — epoch={state.get('epoch')}  iyileşme={improvement:+.1%}", fontsize=11)
+    plt.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    log.info(f"[R/B Swap Test] Görsel kaydedildi: {save_path}")
+
+    return {
+        "mad_before": mad_before, "mad_after": mad_after, "improvement": improvement,
+        "swap_fixed_it": swap_fixed_it, "weight_norms": weight_norms, "indices": idx,
+    }
+
+
 if __name__ == "__main__":
     import sys
     from ..config import DEFAULT_CONFIG
