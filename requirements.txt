@@ -1,5 +1,11 @@
-torch>=2.1.0
-torchvision>=0.16.0
+# train.py torch.amp.GradScaler(device, ...) / autocast(device, ...) cihaz-
+# parametreli API'sini kullanıyor — bu, torch>=2.3.0 gerektirir. Alt sınır
+# 2.1.0 iken bu API import hatası veriyordu (bu oturumda tespit edildi).
+# facenet-pytorch 2.6.0 metadata'sı torch<2.3.0 ister ama torch 2.3+ ile
+# FİİLEN çalışıyor (doğrulandı) — bu yüzden facenet-pytorch üst sınırı
+# zorlanmıyor, sadece torch/torchvision alt sınırı yükseltildi.
+torch>=2.3.0
+torchvision>=0.18.0
 facenet-pytorch>=2.5.3
 insightface>=0.7.3
 onnxruntime>=1.16.0
