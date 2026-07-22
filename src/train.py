@@ -467,7 +467,11 @@ def train(
 
             scaler.scale(g_total).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # clip_grad_norm_ CLIP'TEN ONCEKI toplam normu dondurur - bu deger
+            # zaten hesaplaniyordu ama loglanmiyordu. Buyuk sicramalari (patlama)
+            # tespit etmek icin loglaniyor (bkz. proje notlari - epoch gecisi
+            # instabilite teshisi).
+            raw_grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -475,6 +479,10 @@ def train(
                 ema.update(model)
 
             global_step = epoch * len(train_loader) + step
+            # grad_norm HER adimda (log_every_steps'ten bagimsiz) TB'ye yaziliyor
+            # ki kisa surели bir sicrama (patlama) log-sampling'de kacirilmasin.
+            writer.add_scalar("train/grad_norm_preclip", float(raw_grad_norm), global_step)
+
             if step % cfg.train.log_every_steps == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 lpips_str = f"lpips={losses['lpips'].item():.4f}  " if cfg.loss.use_lpips else ""
@@ -490,6 +498,7 @@ def train(
                     f"id={losses['identity'].item():.4f}  "
                     f"perc={losses['perceptual'].item():.4f}  "
                     f"{lpips_str}{cycle_str}{div_str}"
+                    f"grad_norm={float(raw_grad_norm):.3f}  "
                     f"lr={lr:.2e}"
                 )
                 for k, v in losses.items():

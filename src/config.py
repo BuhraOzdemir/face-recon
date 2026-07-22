@@ -226,3 +226,28 @@ QUICK_TEST_PHASE_FIX_CONFIG = Config(
     loss=LossConfig(phase1_epochs=2, phase2_epochs=7, phase3_epochs=6),
     train=TrainConfig(epochs=15, use_ema=True, eval_use_ema=True),
 )
+
+# ── 5-epoch/20k-örnek regresyon testi (LR-warmup × phase1 çakışması DÜZELTİLMİŞ) ─
+# TEŞHİS: warmup_epochs=1 VE phase1_epochs=1 aynı config'te kullanılınca,
+# scheduler epoch-başı (batch-başı DEĞİL) step() attığı için LR epoch 0→1
+# geçişinde TEK ADIMDA 1e-6'dan 1e-4'e (100x) sıçrıyor — VE identity loss
+# (ağırlık 5.0) de AYNI epoch geçişinde ilk kez devreye giriyor. Bu iki
+# değişikliğin çakışması (küçük-LR ısınmasında biriken AdamW momentum/
+# ikinci-moment tahminlerinin, aniden 100x LR + yepyeni bir loss yüzeyiyle
+# karşılaşması) gözlemlenen regresyonu (epoch 2'den itibaren val loss'un
+# sürekli artması, çıktının Tanh uçlarına kilitlenmesi, identity/cosine_sim
+# ~0 kalması) açıklıyor. Xavier(tanh) init'in KENDİSİ ekarte edildi —
+# eskisinden (Kaiming) ~2x DAHA KÜÇÜK varyanslı, doygunluğu artırmaz
+# (bkz. konuşma geçmişi, sayısal doğrulama).
+#
+# DÜZELTME: phase1_epochs = warmup_epochs + 1 (identity, LR tam LR'ye
+# ulaştıktan BİR epoch SONRA devreye giriyor — çakışma izole ediliyor).
+# Diğer her şey (epochs=5, max_samples=20_000, warmup_epochs=1, GAN yok,
+# EMA açık) sizin bildirdiğiniz koşullarla AYNI tutuldu ki "sadece bu
+# değişiklik neyi düzeltti" sorusuna net cevap alınabilsin.
+FIVE_EPOCH_REGRESSION_FIX_CONFIG = Config(
+    data=DataConfig(max_samples=20_000),
+    model=ModelConfig(use_cascade_skip=False, use_noise_injection=False),
+    loss=LossConfig(phase1_epochs=2, phase2_epochs=2, phase3_epochs=1),
+    train=TrainConfig(epochs=5, warmup_epochs=1, use_ema=True, eval_use_ema=True),
+)
