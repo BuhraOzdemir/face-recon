@@ -25,10 +25,10 @@ class DataConfig:
 class ModelConfig:
     embedding_dim: int = 512
     initial_spatial: int = 4
-    # PixelShuffle + 2x DWRes ile INT8 <5MB: 192→(192,128,96,64,32) ≈4.94MB
+    # bilinear + 2x DWRes; INT8 <5MB hedefi: 192→(192,128,96,64,32)
     initial_channels: int = 192
     decoder_channels: tuple = (192, 128, 96, 64, 32)
-    # "batch" (varsayılan, mevcut checkpoint'lerle uyumlu) veya "instance".
+    # "batch" (varsayılan) veya "instance".
     # state_dict anahtarları değiştiği için ESKİ checkpoint'ler norm_type
     # değiştirilince YÜKLENEMEZ — değiştirirken sıfırdan eğitim gerekir.
     norm_type: str = "batch"
@@ -37,10 +37,10 @@ class ModelConfig:
     use_noise_injection: bool = False
     noise_dim: int = 64
 
-    # ── Cascade skip (düşük-frekans kısayolu, keskinlik için) ───────────
-    # Son cascade_skip_last_n_blocks upsample bloğuna uygulanır (<5MB INT8).
-    # Kapalıyken mimari birebir aynıdır; açmak sıfırdan eğitim gerektirir.
-    use_cascade_skip: bool = True
+    # ── Cascade skip (düşük-frekans kısayolu) ───────────────────────────
+    # Varsayılan kapalı: nearest/erken skip + zayıf decoder ızgara üretebilir.
+    # Açmak sıfırdan eğitim gerektirir.
+    use_cascade_skip: bool = False
     cascade_skip_last_n_blocks: int = 2
 
 

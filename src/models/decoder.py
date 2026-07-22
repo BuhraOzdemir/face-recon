@@ -3,10 +3,10 @@ FaceDecoder: Embedding (512-dim) → 128×128 RGB yüz görüntüsü.
 
 Mimari (kalite odaklı, mobil üst sınır içinde):
     MLP Mapping Head   : 512 → 512 → 4×4×192
-    UpsampleBlock ×5   : 4→8→16→32→64→128 px  (PixelShuffle + 2× DWRes)
+    UpsampleBlock ×5   : 4→8→16→32→64→128 px  (bilinear + Conv + 2× DWRes)
     Output Conv        : 32ch → 3ch RGB
     ─────────────────────────────────────────
-    ~4.9M param → INT8 TFLite hedefi: < 5 MB
+    INT8 TFLite hedefi: < 5 MB
 """
 
 import torch
@@ -88,13 +88,14 @@ class DWResBlock(nn.Module):
 
 class UpsampleBlock(nn.Module):
     """
-    PixelShuffle Upsample (×2) + Conv2d + 2× DWResBlock.
+    Bilinear Upsample (×2) + Conv2d + 2× DWResBlock.
 
-    Conv → PixelShuffle öğrenilebilir yüksek frekans üretir;
-    bilinear'e göre daha az soft blur.
+    PixelShuffle checkerboard artifact üretir (özellikle erken eğitimde
+    yoğun ızgara deseni). Teknik rapordaki öneri: Upsample + Conv —
+    checkerboard yok, eğitim stabil.
 
     ── Cascade skip (opsiyonel) ──
-    Bloğun girdisi 1×1 conv + nearest-upsample ile çıktıya eklenir.
+    Bloğun girdisi 1×1 conv + bilinear-upsample ile çıktıya eklenir.
     Kapalıyken mimari birebir aynı kalır.
     """
 
@@ -109,8 +110,8 @@ class UpsampleBlock(nn.Module):
     ):
         super().__init__()
         self.up = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(2),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
             _make_norm(norm_type, out_ch),
             nn.LeakyReLU(0.2, inplace=True),
         )
@@ -124,9 +125,9 @@ class UpsampleBlock(nn.Module):
         if use_cascade_skip:
             self.skip_proj = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             )
-            # Sıfır-init: ilk forward'da skip'siz hallle matematiksel özdeş
+            # Sıfır-init: ilk forward'da skip'siz halle matematiksel özdeş
             nn.init.zeros_(self.skip_proj[0].weight)
 
     def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
