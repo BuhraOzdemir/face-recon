@@ -38,9 +38,16 @@ log = logging.getLogger(__name__)
 # ─── Görüntü dönüşümleri ──────────────────────────────────────────────────────
 
 def build_train_transform(image_size: int = 128) -> transforms.Compose:
+    # NOT: RandomHorizontalFlip KASITLI OLARAK YOK. embedding, preprocess
+    # sırasında orijinal (aynalanmamış) görüntüden hesaplanıp .npy'den SABİT
+    # yükleniyor (FaceDataset.__getitem__) — ama transform SADECE image'e
+    # uygulanıyor. Flip açıksa, eğitim adımlarının ~%50'sinde AYNI z'ye
+    # yüzün aynalanmış hali hedef gösteriliyordu; ArcFace-ailesi embedding'ler
+    # yön/poz bilgisini güvenilir taşımadığı için decoder bu iki çelişen
+    # hedef arasında uzlaşmaya (sol/sağ tutarsız, bölünmüş yüz çıktısı)
+    # zorlanıyordu. Kaldırılması sıfırdan eğitim gerektirir.
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
