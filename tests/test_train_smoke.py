@@ -25,7 +25,9 @@ from src.train import save_checkpoint  # noqa: E402
 class TestDefaultConfig(unittest.TestCase):
     def test_no_gan_fields(self):
         cfg = DEFAULT_CONFIG
-        self.assertTrue(cfg.model.use_cascade_skip)
+        # Varsayılan KAPALI (bkz. config.py yorumu: nearest/erken skip zayıf
+        # decoder'da grid artifact üretebilir; açmak sıfırdan eğitim ister).
+        self.assertFalse(cfg.model.use_cascade_skip)
         self.assertEqual(cfg.model.cascade_skip_last_n_blocks, 2)
         self.assertTrue(cfg.train.use_ema)
         self.assertTrue(cfg.train.eval_use_ema)
